@@ -1,0 +1,514 @@
+/*
+ * This file is part of the Nautilus AeroKernel developed
+ * by the Hobbes and V3VEE Projects with funding from the
+ * United States National Science Foundation and the Department of Energy.
+ *
+ * The V3VEE Project is a joint project between Northwestern University
+ * and the University of New Mexico.  The Hobbes Project is a collaboration
+ * led by Sandia National Laboratories that includes several national
+ * laboratories and universities. You can find out more at:
+ * http://www.v3vee.org  and
+ * http://xstack.sandia.gov/hobbes
+ *
+ * This is free software.  You are permitted to use,
+ * redistribute, and modify it as specified in the file "LICENSE.txt".
+ */
+
+/*
+ * xHCI (eXtensible Host Controller Interface) USB host controller driver.
+ *
+ * Register offsets, TRB layouts, and context structures follow the Intel
+ * xHCI specification revision 1.2.
+ */
+
+#ifndef __XHCI_H__
+#define __XHCI_H__
+
+#include <nautilus/naut_types.h>
+#include <nautilus/spinlock.h>
+
+struct pci_dev;
+struct naut_info;
+
+/* ------------------------------------------------------------------------ */
+/* MMIO accessors (xHCI spec §5: ordering matters for some sequences).       */
+/* ------------------------------------------------------------------------ */
+
+#define xhci_readb(addr)      (*((volatile uint8_t  *)(addr)))
+#define xhci_readw(addr)      (*((volatile uint16_t *)(addr)))
+#define xhci_readl(addr)      (*((volatile uint32_t *)(addr)))
+#define xhci_readq(addr)      (*((volatile uint64_t *)(addr)))
+
+#define xhci_writeb(addr, v)  ((*((volatile uint8_t  *)(addr))) = (v))
+#define xhci_writew(addr, v)  ((*((volatile uint16_t *)(addr))) = (v))
+#define xhci_writel(addr, v)  ((*((volatile uint32_t *)(addr))) = (v))
+#define xhci_writeq(addr, v)  ((*((volatile uint64_t *)(addr))) = (v))
+
+#define xhci_mb()             __asm__ volatile("mfence" ::: "memory")
+#define xhci_rmb()            __asm__ volatile("lfence" ::: "memory")
+#define xhci_wmb()            __asm__ volatile("sfence" ::: "memory")
+
+/* ------------------------------------------------------------------------ */
+/* PCI class identifiers for xHCI controllers (PCI Code & ID Assignment).    */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_PCI_CLASS         0x0c   /* Serial Bus Controller             */
+#define XHCI_PCI_SUBCLASS      0x03   /* USB controller                    */
+#define XHCI_PCI_PROGIF        0x30   /* xHCI                              */
+
+/* ------------------------------------------------------------------------ */
+/* Capability Registers (offsets from MMIO base).                            */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_CAP_CAPLENGTH     0x00   /*  8-bit  capability register length */
+#define XHCI_CAP_HCIVERSION    0x02   /* 16-bit  spec version (BCD)         */
+#define XHCI_CAP_HCSPARAMS1    0x04   /* MaxSlots/MaxIntrs/MaxPorts         */
+#define XHCI_CAP_HCSPARAMS2    0x08   /* IST, ERST max, scratchpad bufs     */
+#define XHCI_CAP_HCSPARAMS3    0x0C   /* U1/U2 exit latencies               */
+#define XHCI_CAP_HCCPARAMS1    0x10   /* AC64, CSZ, ext-cap pointer, ...    */
+#define XHCI_CAP_DBOFF         0x14   /* Doorbell array offset              */
+#define XHCI_CAP_RTSOFF        0x18   /* Runtime register offset            */
+#define XHCI_CAP_HCCPARAMS2    0x1C
+
+/* HCSPARAMS1 fields */
+#define XHCI_HCS1_MAXSLOTS(x)  ((x) & 0xff)
+#define XHCI_HCS1_MAXINTRS(x)  (((x) >> 8) & 0x7ff)
+#define XHCI_HCS1_MAXPORTS(x)  (((x) >> 24) & 0xff)
+
+/* HCSPARAMS2 fields */
+#define XHCI_HCS2_IST(x)             ((x) & 0xf)
+#define XHCI_HCS2_ERST_MAX(x)        (((x) >> 4) & 0xf)
+#define XHCI_HCS2_SPB_MAX_HI(x)      (((x) >> 21) & 0x1f)
+#define XHCI_HCS2_SPB_MAX_LO(x)      (((x) >> 27) & 0x1f)
+#define XHCI_HCS2_SPB_MAX(x) \
+        ((XHCI_HCS2_SPB_MAX_HI(x) << 5) | XHCI_HCS2_SPB_MAX_LO(x))
+
+/* HCCPARAMS1 fields */
+#define XHCI_HCC1_AC64(x)      ((x) & 0x1)         /* 64-bit addressing    */
+#define XHCI_HCC1_BNC(x)       (((x) >> 1) & 0x1)  /* bandwidth negotiation*/
+#define XHCI_HCC1_CSZ(x)       (((x) >> 2) & 0x1)  /* 0 = 32B, 1 = 64B ctx */
+#define XHCI_HCC1_PPC(x)       (((x) >> 3) & 0x1)  /* port power control   */
+#define XHCI_HCC1_PIND(x)      (((x) >> 4) & 0x1)  /* port indicator ctl   */
+#define XHCI_HCC1_LHRC(x)      (((x) >> 5) & 0x1)  /* light HC reset cap   */
+#define XHCI_HCC1_LTC(x)       (((x) >> 6) & 0x1)  /* latency tolerance    */
+#define XHCI_HCC1_NSS(x)       (((x) >> 7) & 0x1)  /* no secondary SID     */
+#define XHCI_HCC1_MAX_PSA(x)   (((x) >> 12) & 0xf) /* max primary stream   */
+#define XHCI_HCC1_XECP(x)      (((x) >> 16) & 0xffff) /* ext-cap ptr (dwords) */
+
+/* ------------------------------------------------------------------------ */
+/* Operational Registers (offsets from base + CAPLENGTH).                    */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_OP_USBCMD         0x00
+#define XHCI_OP_USBSTS         0x04
+#define XHCI_OP_PAGESIZE       0x08
+#define XHCI_OP_DNCTRL         0x14
+#define XHCI_OP_CRCR           0x18   /* 64-bit                              */
+#define XHCI_OP_DCBAAP         0x30   /* 64-bit                              */
+#define XHCI_OP_CONFIG         0x38
+#define XHCI_OP_PORT_BASE      0x400  /* per-port reg block, stride 0x10     */
+#define XHCI_OP_PORT_STRIDE    0x10
+
+/* Per-port register offsets within a port's 16-byte block. */
+#define XHCI_PORT_PORTSC       0x00
+#define XHCI_PORT_PORTPMSC     0x04
+#define XHCI_PORT_PORTLI       0x08
+#define XHCI_PORT_PORTHLPMC    0x0C
+
+/* USBCMD bits */
+#define XHCI_CMD_RS            (1u << 0)   /* run/stop                      */
+#define XHCI_CMD_HCRST         (1u << 1)   /* host controller reset         */
+#define XHCI_CMD_INTE          (1u << 2)   /* interrupter enable            */
+#define XHCI_CMD_HSEE          (1u << 3)   /* host system error enable      */
+#define XHCI_CMD_LHCRST        (1u << 7)   /* light HC reset                */
+#define XHCI_CMD_CSS           (1u << 8)   /* controller save state         */
+#define XHCI_CMD_CRS           (1u << 9)   /* controller restore state      */
+#define XHCI_CMD_EWE           (1u << 10)  /* enable wrap event             */
+#define XHCI_CMD_EU3S          (1u << 11)  /* enable U3 MFINDEX stop        */
+
+/* USBSTS bits */
+#define XHCI_STS_HCH           (1u << 0)   /* HC halted                     */
+#define XHCI_STS_HSE           (1u << 2)   /* host system error             */
+#define XHCI_STS_EINT          (1u << 3)   /* event interrupt (W1C)         */
+#define XHCI_STS_PCD           (1u << 4)   /* port change detect (W1C)      */
+#define XHCI_STS_SSS           (1u << 8)   /* save state status             */
+#define XHCI_STS_RSS           (1u << 9)   /* restore state status          */
+#define XHCI_STS_SRE           (1u << 10)  /* save/restore error (W1C)      */
+#define XHCI_STS_CNR           (1u << 11)  /* controller not ready          */
+#define XHCI_STS_HCE           (1u << 12)  /* host controller error         */
+
+/* CRCR bits (low dword) */
+#define XHCI_CRCR_RCS          (1u << 0)   /* ring cycle state              */
+#define XHCI_CRCR_CS           (1u << 1)   /* command stop                  */
+#define XHCI_CRCR_CA           (1u << 2)   /* command abort                 */
+#define XHCI_CRCR_CRR          (1u << 3)   /* command ring running          */
+
+/* CONFIG bits */
+#define XHCI_CONFIG_MAXSLOTSEN_MASK  0xff
+
+/* PORTSC bits (xHCI §5.4.8) */
+#define XHCI_PORTSC_CCS        (1u << 0)   /* current connect status        */
+#define XHCI_PORTSC_PED        (1u << 1)   /* port enabled/disabled         */
+#define XHCI_PORTSC_OCA        (1u << 3)   /* overcurrent active            */
+#define XHCI_PORTSC_PR         (1u << 4)   /* port reset                    */
+#define XHCI_PORTSC_PLS_SHIFT  5
+#define XHCI_PORTSC_PLS_MASK   (0xfu << XHCI_PORTSC_PLS_SHIFT)
+#define XHCI_PORTSC_PP         (1u << 9)   /* port power                    */
+#define XHCI_PORTSC_SPEED_SHIFT 10
+#define XHCI_PORTSC_SPEED_MASK (0xfu << XHCI_PORTSC_SPEED_SHIFT)
+#define XHCI_PORTSC_PIC_SHIFT  14
+#define XHCI_PORTSC_PIC_MASK   (0x3u << XHCI_PORTSC_PIC_SHIFT)
+#define XHCI_PORTSC_LWS        (1u << 16)  /* link state write strobe       */
+#define XHCI_PORTSC_CSC        (1u << 17)  /* connect status change   (W1C) */
+#define XHCI_PORTSC_PEC        (1u << 18)  /* port enable/disable chg (W1C) */
+#define XHCI_PORTSC_WRC        (1u << 19)  /* warm port reset change  (W1C) */
+#define XHCI_PORTSC_OCC        (1u << 20)  /* overcurrent change      (W1C) */
+#define XHCI_PORTSC_PRC        (1u << 21)  /* port reset change       (W1C) */
+#define XHCI_PORTSC_PLC        (1u << 22)  /* port link state change  (W1C) */
+#define XHCI_PORTSC_CEC        (1u << 23)  /* port config error change(W1C) */
+#define XHCI_PORTSC_CAS        (1u << 24)  /* cold attach status            */
+#define XHCI_PORTSC_WCE        (1u << 25)  /* wake on connect enable        */
+#define XHCI_PORTSC_WDE        (1u << 26)  /* wake on disconnect enable     */
+#define XHCI_PORTSC_WOE        (1u << 27)  /* wake on overcurrent enable    */
+#define XHCI_PORTSC_DR         (1u << 30)  /* device removable              */
+#define XHCI_PORTSC_WPR        (1u << 31)  /* warm port reset (USB3)        */
+
+/* Bits that are W1C: when writing PORTSC, mask these unless ack'ing. */
+#define XHCI_PORTSC_W1C_MASK \
+        (XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_WRC | \
+         XHCI_PORTSC_OCC | XHCI_PORTSC_PRC | XHCI_PORTSC_PLC | \
+         XHCI_PORTSC_CEC)
+
+/* USB speeds reported in PORTSC (xHCI §7.2.2.1.1 default mapping). */
+#define XHCI_SPEED_FS          1   /* Full-Speed   12 Mb/s                  */
+#define XHCI_SPEED_LS          2   /* Low-Speed     1.5 Mb/s                */
+#define XHCI_SPEED_HS          3   /* High-Speed  480 Mb/s                  */
+#define XHCI_SPEED_SS          4   /* SuperSpeed    5 Gb/s                  */
+#define XHCI_SPEED_SSP         5   /* SuperSpeedPlus 10 Gb/s                */
+
+/* ------------------------------------------------------------------------ */
+/* Runtime Registers (offsets from base + RTSOFF).                           */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_RT_MFINDEX        0x00
+#define XHCI_RT_IR_BASE        0x20   /* interrupter set 0                  */
+#define XHCI_RT_IR_STRIDE      0x20
+
+/* Interrupter register offsets relative to its base. */
+#define XHCI_IR_IMAN           0x00   /* interrupt management              */
+#define XHCI_IR_IMOD           0x04   /* interrupt moderation              */
+#define XHCI_IR_ERSTSZ         0x08   /* ERST size (low 16 bits)           */
+#define XHCI_IR_ERSTBA         0x10   /* ERST base address (64-bit)        */
+#define XHCI_IR_ERDP           0x18   /* event ring dequeue ptr (64-bit)   */
+
+/* IMAN bits */
+#define XHCI_IMAN_IP           (1u << 0)  /* interrupt pending (W1C)       */
+#define XHCI_IMAN_IE           (1u << 1)  /* interrupt enable              */
+
+/* ERDP bits (low 4 bits within the 64-bit value) */
+#define XHCI_ERDP_DESI_MASK    0x7u
+#define XHCI_ERDP_EHB          (1u << 3)  /* event handler busy (W1C)      */
+#define XHCI_ERDP_PTR_MASK     (~0xfULL)
+
+/* ------------------------------------------------------------------------ */
+/* Doorbell Registers (offsets from base + DBOFF).                           */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_DB_HOST           0    /* doorbell 0 = command ring           */
+#define XHCI_DB_TARGET(t)      ((t) & 0xff)             /* DB target/EPID  */
+#define XHCI_DB_STREAM(s)      (((s) & 0xffff) << 16)   /* stream ID       */
+
+#define XHCI_DB_CMD_DOORBELL   0    /* value to ring command doorbell      */
+
+/* ------------------------------------------------------------------------ */
+/* TRB layout and type constants (xHCI §6.4).                                */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Common 16-byte TRB layout. All TRB variants overlay this template; the
+ * `control` field's bits 10-15 carry the TRB type and bit 0 is the cycle bit.
+ */
+struct xhci_trb {
+    uint64_t param;     /* address or immediate data                      */
+    uint32_t status;    /* transfer length / completion code              */
+    uint32_t control;   /* type, cycle bit, flags                         */
+} __attribute__((packed));
+
+/* control-field layout helpers */
+#define XHCI_TRB_CYCLE         (1u << 0)
+#define XHCI_TRB_ENT           (1u << 1)   /* evaluate next TRB           */
+#define XHCI_TRB_ISP           (1u << 2)   /* interrupt on short packet   */
+#define XHCI_TRB_NS            (1u << 3)   /* no snoop                    */
+#define XHCI_TRB_CH            (1u << 4)   /* chain bit                   */
+#define XHCI_TRB_IOC           (1u << 5)   /* interrupt on completion     */
+#define XHCI_TRB_IDT           (1u << 6)   /* immediate data              */
+#define XHCI_TRB_BSR           (1u << 9)   /* block set address request   */
+#define XHCI_TRB_TC            (1u << 1)   /* toggle cycle (LINK only)    */
+#define XHCI_TRB_DIR_IN        (1u << 16)  /* data stage direction = IN   */
+#define XHCI_TRB_TYPE_SHIFT    10
+#define XHCI_TRB_TYPE_MASK     (0x3fu << XHCI_TRB_TYPE_SHIFT)
+#define XHCI_TRB_TYPE(t)       (((t) & 0x3fu) << XHCI_TRB_TYPE_SHIFT)
+#define XHCI_TRB_GET_TYPE(c)   (((c) >> XHCI_TRB_TYPE_SHIFT) & 0x3fu)
+
+/* status-field helpers */
+#define XHCI_TRB_LEN(s)        ((s) & 0x1ffff)
+#define XHCI_TRB_TD_SIZE(n)    (((n) & 0x1f) << 17)
+#define XHCI_TRB_INTR(i)       (((i) & 0x3ff) << 22)
+#define XHCI_TRB_GET_COMP(s)   (((s) >> 24) & 0xff)
+#define XHCI_TRB_GET_LEN(s)    ((s) & 0xffffff)
+
+/* TRB types -- xHCI §6.4.6 Table 6-91. */
+enum xhci_trb_type {
+    XHCI_TRB_RESERVED            = 0,
+
+    /* Transfer ring TRBs */
+    XHCI_TRB_NORMAL              = 1,
+    XHCI_TRB_SETUP_STAGE         = 2,
+    XHCI_TRB_DATA_STAGE          = 3,
+    XHCI_TRB_STATUS_STAGE        = 4,
+    XHCI_TRB_ISOCH               = 5,
+    XHCI_TRB_LINK                = 6,
+    XHCI_TRB_EVENT_DATA          = 7,
+    XHCI_TRB_NO_OP               = 8,
+
+    /* Command ring TRBs */
+    XHCI_TRB_ENABLE_SLOT         = 9,
+    XHCI_TRB_DISABLE_SLOT        = 10,
+    XHCI_TRB_ADDRESS_DEVICE      = 11,
+    XHCI_TRB_CONFIGURE_ENDPOINT  = 12,
+    XHCI_TRB_EVALUATE_CONTEXT    = 13,
+    XHCI_TRB_RESET_ENDPOINT      = 14,
+    XHCI_TRB_STOP_ENDPOINT       = 15,
+    XHCI_TRB_SET_TR_DEQUEUE      = 16,
+    XHCI_TRB_RESET_DEVICE        = 17,
+    XHCI_TRB_FORCE_EVENT         = 18,
+    XHCI_TRB_NEG_BANDWIDTH       = 19,
+    XHCI_TRB_SET_LATENCY_TOL     = 20,
+    XHCI_TRB_GET_PORT_BANDWIDTH  = 21,
+    XHCI_TRB_FORCE_HEADER        = 22,
+    XHCI_TRB_NO_OP_CMD           = 23,
+
+    /* Event ring TRBs */
+    XHCI_TRB_TRANSFER_EVENT      = 32,
+    XHCI_TRB_COMMAND_COMPLETION  = 33,
+    XHCI_TRB_PORT_STATUS_CHANGE  = 34,
+    XHCI_TRB_BANDWIDTH_REQUEST   = 35,
+    XHCI_TRB_DOORBELL_EVENT      = 36,
+    XHCI_TRB_HOST_CONTROLLER_EVT = 37,
+    XHCI_TRB_DEVICE_NOTIFICATION = 38,
+    XHCI_TRB_MFINDEX_WRAP        = 39,
+};
+
+/* Completion codes -- xHCI §6.4.5 Table 6-90 (subset). */
+enum xhci_completion_code {
+    XHCI_CC_INVALID              = 0,
+    XHCI_CC_SUCCESS              = 1,
+    XHCI_CC_DATA_BUFFER_ERROR    = 2,
+    XHCI_CC_BABBLE_DETECTED      = 3,
+    XHCI_CC_USB_TRANSACTION_ERR  = 4,
+    XHCI_CC_TRB_ERROR            = 5,
+    XHCI_CC_STALL_ERROR          = 6,
+    XHCI_CC_RESOURCE_ERROR       = 7,
+    XHCI_CC_BANDWIDTH_ERROR      = 8,
+    XHCI_CC_NO_SLOTS_AVAILABLE   = 9,
+    XHCI_CC_INVALID_STREAM_TYPE  = 10,
+    XHCI_CC_SLOT_NOT_ENABLED     = 11,
+    XHCI_CC_EP_NOT_ENABLED       = 12,
+    XHCI_CC_SHORT_PACKET         = 13,
+    XHCI_CC_RING_UNDERRUN        = 14,
+    XHCI_CC_RING_OVERRUN         = 15,
+    XHCI_CC_PARAMETER_ERROR      = 17,
+    XHCI_CC_CONTEXT_STATE_ERROR  = 19,
+    XHCI_CC_EVENT_RING_FULL      = 21,
+    XHCI_CC_COMMAND_ABORTED      = 24,
+    XHCI_CC_STOPPED              = 26,
+};
+
+/* ------------------------------------------------------------------------ */
+/* Endpoint context types (xHCI §6.2.3 Table 6-9).                           */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_EP_TYPE_INVALID    0
+#define XHCI_EP_TYPE_ISOCH_OUT  1
+#define XHCI_EP_TYPE_BULK_OUT   2
+#define XHCI_EP_TYPE_INTR_OUT   3
+#define XHCI_EP_TYPE_CONTROL    4
+#define XHCI_EP_TYPE_ISOCH_IN   5
+#define XHCI_EP_TYPE_BULK_IN    6
+#define XHCI_EP_TYPE_INTR_IN    7
+
+/* Endpoint ID encoding for doorbell / context lookup: 2*ep + (in?1:0). */
+#define XHCI_EP_ID(ep, in)      ((((ep) & 0xf) << 1) | ((in) ? 1 : 0))
+#define XHCI_EP0_ID             1   /* control EP0 = doorbell target 1     */
+
+/* ------------------------------------------------------------------------ */
+/* Context structures.                                                       */
+/*                                                                           */
+/* The xHCI spec defines a 32-byte context layout (CSZ=0) and a 64-byte      */
+/* layout (CSZ=1).  We define the 32-byte form below; callers that need the  */
+/* 64-byte form should size allocations using `hc->context_size` and index   */
+/* using byte offsets rather than C-array indexing on these structs.         */
+/* ------------------------------------------------------------------------ */
+
+/* 32-byte slot context (8 dwords) */
+struct xhci_slot_ctx {
+    uint32_t fields[8];
+} __attribute__((packed));
+
+/* Slot context dword 0 fields */
+#define XHCI_SLOT_DW0_ROUTE_MASK        0x000fffffu
+#define XHCI_SLOT_DW0_SPEED_SHIFT       20
+#define XHCI_SLOT_DW0_SPEED_MASK        (0xfu << 20)
+#define XHCI_SLOT_DW0_MTT               (1u << 25)
+#define XHCI_SLOT_DW0_HUB               (1u << 26)
+#define XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT 27
+#define XHCI_SLOT_DW0_CTX_ENTRIES_MASK  (0x1fu << 27)
+
+/* Slot context dword 1 fields */
+#define XHCI_SLOT_DW1_RH_PORT_SHIFT     16
+#define XHCI_SLOT_DW1_RH_PORT_MASK      (0xffu << 16)
+#define XHCI_SLOT_DW1_NUM_PORTS_SHIFT   24
+#define XHCI_SLOT_DW1_NUM_PORTS_MASK    (0xffu << 24)
+
+/* 32-byte endpoint context (8 dwords) */
+struct xhci_ep_ctx {
+    uint32_t fields[8];
+} __attribute__((packed));
+
+/* Endpoint context dword 0 fields */
+#define XHCI_EP_DW0_EP_STATE_MASK       0x7u
+#define XHCI_EP_DW0_MULT_SHIFT          8
+#define XHCI_EP_DW0_MAX_PSTREAMS_SHIFT  10
+#define XHCI_EP_DW0_LSA                 (1u << 15)
+#define XHCI_EP_DW0_INTERVAL_SHIFT      16
+
+/* Endpoint context dword 1 fields */
+#define XHCI_EP_DW1_CERR_SHIFT          1   /* error count                 */
+#define XHCI_EP_DW1_EP_TYPE_SHIFT       3
+#define XHCI_EP_DW1_EP_TYPE_MASK        (0x7u << 3)
+#define XHCI_EP_DW1_HID                 (1u << 7)
+#define XHCI_EP_DW1_MAX_BURST_SHIFT     8
+#define XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT  16
+#define XHCI_EP_DW1_MAX_PKT_SIZE_MASK   (0xffffu << 16)
+
+/* TR Dequeue Pointer lives in dwords 2/3 (low/high), low bit = DCS. */
+#define XHCI_EP_DCS                     (1u << 0)
+
+/*
+ * Device context: 1 slot context + 31 endpoint contexts (EP0 + 1..15 in/out).
+ * Total = 32 * 32 = 1024 bytes when CSZ=0; 32 * 64 = 2048 bytes when CSZ=1.
+ */
+struct xhci_device_ctx {
+    struct xhci_slot_ctx slot;
+    struct xhci_ep_ctx   ep[31];
+} __attribute__((packed));
+
+/*
+ * Input control context (32 bytes when CSZ=0, 64 bytes when CSZ=1):
+ *   drop flags, add flags, 6 reserved dwords.
+ * The Input Context as a whole is the input control context immediately
+ * followed by a Device Context.
+ */
+struct xhci_input_ctrl_ctx {
+    uint32_t drop_flags;
+    uint32_t add_flags;
+    uint32_t rsvd[6];
+} __attribute__((packed));
+
+struct xhci_input_ctx {
+    struct xhci_input_ctrl_ctx ctrl;
+    struct xhci_device_ctx     device;
+} __attribute__((packed));
+
+/* Convenient add/drop bits: bit 0 = slot, bit 1 = EP0, bit N+1 = EP N. */
+#define XHCI_INPUT_A0_SLOT      (1u << 0)
+#define XHCI_INPUT_A_EP(epid)   (1u << (epid))
+
+/* ------------------------------------------------------------------------ */
+/* Event Ring Segment Table entry (xHCI §6.5).                               */
+/* ------------------------------------------------------------------------ */
+
+struct xhci_erst_entry {
+    uint64_t base;          /* segment base physical address (64-byte aligned) */
+    uint16_t size;          /* number of TRBs in segment (16..4096)            */
+    uint16_t rsvd1;
+    uint32_t rsvd2;
+} __attribute__((packed));
+
+/* ------------------------------------------------------------------------ */
+/* Software ring tracking.                                                   */
+/* ------------------------------------------------------------------------ */
+
+#define XHCI_RING_SIZE          256   /* TRBs per ring segment              */
+#define XHCI_DCBAA_ALIGN        64
+#define XHCI_RING_ALIGN         64
+#define XHCI_CTX_ALIGN          64
+#define XHCI_ERST_ALIGN         64
+
+struct xhci_ring {
+    struct xhci_trb *trbs;      /* contiguous TRB array (RING_SIZE entries) */
+    uint64_t         trbs_phys; /* physical address of trbs[0]              */
+    uint32_t         enq;       /* enqueue index (driver writes here)       */
+    uint32_t         deq;       /* dequeue index (events: HW advances)      */
+    uint8_t          cycle;     /* current Producer Cycle State             */
+    uint8_t          rsvd[3];
+};
+
+/* ------------------------------------------------------------------------ */
+/* Per-controller state.                                                     */
+/* ------------------------------------------------------------------------ */
+
+struct xhci_hc {
+    /* MMIO regions. cap_base is the BAR mapping; the others are derived. */
+    void     *cap_base;     /* capability registers (BAR0)                */
+    void     *op_base;      /* cap_base + CAPLENGTH                       */
+    void     *rt_base;      /* cap_base + RTSOFF                          */
+    uint32_t *db_base;      /* cap_base + DBOFF                           */
+
+    /* Capabilities snapshot */
+    uint8_t  cap_length;
+    uint8_t  context_size;  /* 32 or 64 bytes per context                 */
+    uint8_t  max_slots;
+    uint8_t  max_ports;
+    uint16_t max_intrs;
+    uint16_t hci_version;
+    uint32_t hcc_params1;
+    uint32_t hcs_params1;
+    uint32_t hcs_params2;
+
+    /* Data structures (all physically contiguous, identity-mapped) */
+    uint64_t            *dcbaa;          /* DCBAA[0..max_slots]            */
+    uint64_t             dcbaa_phys;
+    struct xhci_ring     cmd_ring;
+    struct xhci_ring     event_ring;
+    struct xhci_erst_entry *erst;        /* event ring segment table       */
+    uint64_t             erst_phys;
+    uint32_t             erst_entries;
+
+    /* Optional scratchpad buffers (HCSPARAMS2.SPB_MAX > 0) */
+    uint64_t            *scratchpad_array;
+    uint64_t             scratchpad_array_phys;
+    uint32_t             scratchpad_count;
+
+    /* Slot tracking, indexed 1..max_slots (index 0 unused). */
+    struct xhci_device_ctx **device_ctxs;
+    struct xhci_input_ctx  **input_ctxs;
+
+    /* Synchronization */
+    spinlock_t           lock;
+
+    /* Interrupt routing */
+    int                  irq_vec;
+
+    /* Backing PCI device */
+    struct pci_dev      *pci_dev;
+};
+
+/* ------------------------------------------------------------------------ */
+/* Public driver entry points (defined in src/dev/xhci.c).                   */
+/* ------------------------------------------------------------------------ */
+
+int xhci_pci_init(struct naut_info *naut);
+int xhci_pci_deinit(void);
+
+#endif /* __XHCI_H__ */
