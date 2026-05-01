@@ -2,6 +2,7 @@
 #define __XHCI_H__
 
 #include <nautilus/naut_types.h>
+#include <nautilus/list.h>
 #include <nautilus/spinlock.h>
 
 struct pci_dev;
@@ -483,6 +484,9 @@ struct xhci_hc {
 
     // Backing PCI device
     struct pci_dev      *pci_dev;
+
+    /* Linkage on the driver's controller list (internal). */
+    struct list_head     node;
 };
 
 //

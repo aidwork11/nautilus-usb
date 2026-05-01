@@ -116,6 +116,9 @@
 #ifdef NAUT_CONFIG_E1000E_PCI
 #include <dev/e1000e_pci.h>
 #endif
+#ifdef NAUT_CONFIG_XHCI
+#include <dev/xhci.h>
+#endif
 #ifdef NAUT_CONFIG_RAMDISK
 #include <dev/ramdisk.h>
 #endif
@@ -527,6 +530,10 @@ init (unsigned long mbd,
 
 #ifdef NAUT_CONFIG_E1000E_PCI
     e1000e_pci_init(naut);
+#endif
+
+#ifdef NAUT_CONFIG_XHCI
+    xhci_pci_init(naut);
 #endif
 
 #ifdef NAUT_CONFIG_NET_ETHERNET

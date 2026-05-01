@@ -21,6 +21,8 @@ obj-$(NAUT_CONFIG_E1000_PCI) += e1000_pci.o
 obj-$(NAUT_CONFIG_E1000E_PCI) += e1000e_pci.o
 obj-$(NAUT_CONFIG_MLX3_PCI) += mlx3_ib.o
 
+obj-$(NAUT_CONFIG_XHCI) += xhci.o
+
 obj-$(NAUT_CONFIG_RAMDISK) += ramdisk.o
 
 obj-$(NAUT_CONFIG_ATA) += ata.o

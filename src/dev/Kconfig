@@ -222,6 +222,23 @@ config DEBUG_MLX3_PCI
     help
       Turn on debug prints for the Mellanox ConnectX-3 HCA Driver
 
+config XHCI
+    bool "xHCI USB Host Controller Driver"
+    depends on X86_64_HOST
+    default n
+    help
+      Adds the xHCI (USB 3.x) PCI host controller driver.
+      Currently in early bring-up: PCI probe and capability-register
+      parsing are implemented; controller init and USB enumeration are
+      under development.
+
+config DEBUG_XHCI
+    bool "Debug xHCI"
+    depends on DEBUG_PRINTS && XHCI
+    default n
+    help
+      Turn on debug prints for the xHCI driver
+
 
 config RAMDISK
     bool "RAM Disk Support"
