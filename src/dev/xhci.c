@@ -1,27 +1,3 @@
-/*
- * This file is part of the Nautilus AeroKernel developed
- * by the Hobbes and V3VEE Projects with funding from the
- * United States National Science Foundation and the Department of Energy.
- *
- * The V3VEE Project is a joint project between Northwestern University
- * and the University of New Mexico.  The Hobbes Project is a collaboration
- * led by Sandia National Laboratories that includes several national
- * laboratories and universities. You can find out more at:
- * http://www.v3vee.org  and
- * http://xstack.sandia.gov/hobbes
- *
- * This is free software.  You are permitted to use,
- * redistribute, and modify it as specified in the file "LICENSE.txt".
- */
-
-/*
- * xHCI USB host controller driver.
- *
- * Phase 2 (this file): PCI probe, BAR0 mapping, command-register enable.
- * Later phases will add: HC reset, ring/DCBAA setup, IRQ routing, port
- * management, USB device enumeration.
- */
-
 #include <nautilus/nautilus.h>
 #include <nautilus/cpu.h>
 #include <nautilus/mm.h>
@@ -42,46 +18,36 @@
 #define ERROR(fmt, args...)  ERROR_PRINT("xhci: " fmt, ##args)
 
 
-/* Driver-global list of probed controllers. */
+// Driver-global list of probed controllers.
 static struct list_head xhci_controllers;
-static int              xhci_controllers_inited = 0;
+static int xhci_controllers_inited = 0;
 
 
-/* ------------------------------------------------------------------------- */
-/* Matching                                                                  */
-/* ------------------------------------------------------------------------- */
+//
+// PCI Matching
+//
 
 static int
-xhci_match(struct pci_dev *pdev)
-{
+xhci_match(struct pci_dev *pdev) {
     return pdev->cfg.class_code == XHCI_PCI_CLASS &&
            pdev->cfg.subclass   == XHCI_PCI_SUBCLASS &&
            pdev->cfg.prog_if    == XHCI_PCI_PROGIF;
 }
 
 
-/* ------------------------------------------------------------------------- */
-/* Capability-register parse                                                 */
-/* ------------------------------------------------------------------------- */
+//
+// Capability-register parse 
+//
 
-/*
- * Snapshot the capability registers, derive the operational/runtime/doorbell
- * register windows, and stash everything the rest of the driver needs into
- * struct xhci_hc.  Capability registers are read-only and (per spec §5.3) do
- * not change once the controller is out of reset, so a one-time snapshot is
- * enough -- with the caveat that Phase 3.2 will re-read after HCRST in case
- * a controller updates them across reset.
- */
-static int
-xhci_read_capabilities(struct xhci_hc *hc)
-{
-    uint8_t *base = (uint8_t *)hc->cap_base;
+// Snapshot the capability registers
+// derive the operational/runtime/doorbell
+// register windows, and stash everything the rest of the driver needs int struct xhci_hc. 
+// Capability registers are read-only
 
-    /* Read CAPLENGTH (byte 0) and HCIVERSION (bytes 2-3) as one 32-bit
-       read at offset 0.  Some xHCI implementations require dword-aligned
-       accesses to the capability register file and return zero for narrower
-       reads; this matches Linux's xhci-hcd. */
-    uint32_t cap0 = xhci_readl(base);
+static int xhci_read_capabilities(struct xhci_hc *hc) {
+    uint8_t *bar0 = (uint8_t *)hc->cap_base;
+
+    uint32_t cap0 = xhci_readl(bar0);
     hc->cap_length  = cap0 & 0xff;
     hc->hci_version = (cap0 >> 16) & 0xffff;
     hc->hcs_params1 = xhci_readl(base + XHCI_CAP_HCSPARAMS1);
@@ -93,11 +59,9 @@ xhci_read_capabilities(struct xhci_hc *hc)
     hc->max_ports    = XHCI_HCS1_MAXPORTS(hc->hcs_params1);
     hc->context_size = XHCI_HCC1_CSZ(hc->hcc_params1) ? 64 : 32;
 
-    /* DBOFF and RTSOFF are the byte offsets to the doorbell array and
-       runtime register set, with reserved low bits the spec mandates we
-       mask off (DBOFF: low 2 bits; RTSOFF: low 5 bits). */
-    uint32_t dboff  = xhci_readl(base + XHCI_CAP_DBOFF)  & ~0x3u;
-    uint32_t rtsoff = xhci_readl(base + XHCI_CAP_RTSOFF) & ~0x1fu;
+    // DBOFF and RTSOFF are the byte offsets to the doorbell array and runtime register set, with reserved low bits
+    uint32_t dboff  = xhci_readl(bar0 + XHCI_CAP_DBOFF)  & ~0x3u;
+    uint32_t rtsoff = xhci_readl(bar0 + XHCI_CAP_RTSOFF) & ~0x1fu;
 
     if (hc->cap_length == 0 || hc->cap_length > 0x40) {
         ERROR("implausible CAPLENGTH=0x%x\n", hc->cap_length);
@@ -108,21 +72,19 @@ xhci_read_capabilities(struct xhci_hc *hc)
         return -1;
     }
 
-    hc->op_base = base + hc->cap_length;
-    hc->db_base = (uint32_t *)(base + dboff);
-    hc->rt_base = base + rtsoff;
+    hc->op_base = bar0 + hc->cap_length; // operational regs
+    hc->db_base = (uint32_t *)(bar0 + dboff); // doorbell regs
+    hc->rt_base = bar0 + rtsoff; // runtime regs
 
     return 0;
 }
 
 
-/* ------------------------------------------------------------------------- */
-/* Per-controller initialization                                             */
-/* ------------------------------------------------------------------------- */
+//
+// Per-controller initialization
+//
 
-static int
-xhci_init(struct xhci_hc *hc)
-{
+static int xhci_init(struct xhci_hc *hc) {
     if (xhci_read_capabilities(hc) < 0) {
         return -1;
     }
@@ -137,25 +99,17 @@ xhci_init(struct xhci_hc *hc)
     DEBUG("  HCSPARAMS1=0x%08x HCSPARAMS2=0x%08x HCCPARAMS1=0x%08x\n",
           hc->hcs_params1, hc->hcs_params2, hc->hcc_params1);
 
-    /* Phase 3 will go here: controller reset, DCBAA/cmd-ring/event-ring
-       allocation, MSI-X setup, USBCMD.RS=1.  For now we stop after the
-       capability snapshot so Phase 2 can be tested independently. */
     return 0;
 }
 
 
-/* ------------------------------------------------------------------------- */
-/* PCI probe                                                                 */
-/* ------------------------------------------------------------------------- */
+//
+// PCI probe
+// ensure that the hardware and the driver are compatible
+//
 
-/*
- * Called by pci_map_over_devices for every PCI device on the system.  We
- * filter on (class, subclass, prog_if) = (0x0c, 0x03, 0x30) since xHCI is
- * a class-coded device, not a fixed vendor/device pair.
- */
-static int
-xhci_probe(struct pci_dev *pdev, void *state)
-{
+static int xhci_probe(struct pci_dev *pdev, void *state) {
+
     if (!xhci_match(pdev)) {
         return 0;
     }
@@ -164,7 +118,6 @@ xhci_probe(struct pci_dev *pdev, void *state)
          pdev->bus->num, pdev->num, pdev->fun,
          pdev->cfg.vendor_id, pdev->cfg.device_id);
 
-    /* xHCI uses a single 64-bit MMIO BAR at BAR0. */
     if (pci_dev_get_bar_type(pdev, 0) != PCI_BAR_MEM) {
         ERROR("BAR0 is not memory-mapped\n");
         return -1;
@@ -186,17 +139,13 @@ xhci_probe(struct pci_dev *pdev, void *state)
     memset(hc, 0, sizeof(*hc));
     spinlock_init(&hc->lock);
     INIT_LIST_HEAD(&hc->node);
-    hc->pci_dev  = pdev;
+    hc->pci_dev  = pdev; // back pointer
 
-    /* NK runs identity-mapped on x64 (HRT_HIHALF_OFFSET=0), so the BAR
-       physical address is directly usable as a kernel-virtual MMIO
-       pointer.  Existing drivers (e1000, virtio_pci) do the same.  */
+    // the BAR physical address is directly usable as a kernel-virtual MMIO pointer
     hc->cap_base = (void *)bar_phys;
 
-    /* Enable Memory Space (cmd[1]) and Bus Master (cmd[2]).
-       MMIO must be enabled before we touch any controller register;
-       Bus Master is required for the controller's DMA engines (rings,
-       contexts, scratchpads) once Phase 3 brings them up. */
+    // MMIO must be enabled to make xHCI respond to reads/writes on its BAR address
+    // Bus Master is required for xHCI to initiate its own transfers on the PCI bus
     pci_dev_enable_mmio(pdev);
     pci_dev_enable_master(pdev);
 
@@ -213,13 +162,11 @@ xhci_probe(struct pci_dev *pdev, void *state)
 }
 
 
-/* ------------------------------------------------------------------------- */
-/* Public entry points                                                       */
-/* ------------------------------------------------------------------------- */
+//
+// Public entry points
+//
 
-int
-xhci_pci_init(struct naut_info *naut)
-{
+int xhci_pci_init(struct naut_info *naut) {
     INFO("scanning PCI for xHCI controllers (class=0x%02x sub=0x%02x progif=0x%02x)\n",
          XHCI_PCI_CLASS, XHCI_PCI_SUBCLASS, XHCI_PCI_PROGIF);
 
@@ -228,9 +175,7 @@ xhci_pci_init(struct naut_info *naut)
         xhci_controllers_inited = 1;
     }
 
-    /* pci_map_over_devices uses 0xffff as the "match any" sentinel for
-       both vendor and device.  Class/subclass/progif filtering happens
-       inside xhci_probe. */
+    // pci_map_over_devices uses 0xffff as "match any" for both vendor and device
     int rc = pci_map_over_devices(xhci_probe, 0xffff, 0xffff, NULL);
     if (rc < 0) {
         ERROR("PCI scan failed\n");
@@ -243,10 +188,6 @@ xhci_pci_init(struct naut_info *naut)
     return 0;
 }
 
-int
-xhci_pci_deinit(void)
-{
-    /* Phase 2 has nothing reversible besides the BAR/master enables; the
-       fuller teardown belongs after Phase 3. */
+int xhci_pci_deinit(void) {
     return 0;
 }
