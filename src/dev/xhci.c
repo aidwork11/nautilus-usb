@@ -50,9 +50,9 @@ static int xhci_read_capabilities(struct xhci_hc *hc) {
     uint32_t cap0 = xhci_readl(bar0);
     hc->cap_length  = cap0 & 0xff;
     hc->hci_version = (cap0 >> 16) & 0xffff;
-    hc->hcs_params1 = xhci_readl(base + XHCI_CAP_HCSPARAMS1);
-    hc->hcs_params2 = xhci_readl(base + XHCI_CAP_HCSPARAMS2);
-    hc->hcc_params1 = xhci_readl(base + XHCI_CAP_HCCPARAMS1);
+    hc->hcs_params1 = xhci_readl(bar0 + XHCI_CAP_HCSPARAMS1);
+    hc->hcs_params2 = xhci_readl(bar0 + XHCI_CAP_HCSPARAMS2);
+    hc->hcc_params1 = xhci_readl(bar0 + XHCI_CAP_HCCPARAMS1);
 
     hc->max_slots    = XHCI_HCS1_MAXSLOTS(hc->hcs_params1);
     hc->max_intrs    = XHCI_HCS1_MAXINTRS(hc->hcs_params1);
@@ -81,10 +81,110 @@ static int xhci_read_capabilities(struct xhci_hc *hc) {
 
 
 //
+// Polling helper
+//
+// Spin reading a 32-bit MMIO register until (val & mask) == (expected & mask),
+// or until timeout_us microseconds have elapsed. Returns 0 on success, -1 on
+// timeout. Used for xHCI register handshakes (USBSTS.HCH, USBCMD.HCRST,
+// USBSTS.CNR).
+//
+static int xhci_poll_until(void *reg, uint32_t mask, uint32_t expected,
+                           uint32_t timeout_us, const char *what) {
+    while (timeout_us > 0) {
+        uint32_t v = xhci_readl(reg);
+        if ((v & mask) == (expected & mask)) {
+            return 0;
+        }
+        udelay(1);
+        timeout_us--;
+    }
+    ERROR("timeout waiting for %s (mask=0x%08x expected=0x%08x got=0x%08x)\n",
+          what, mask, expected, xhci_readl(reg));
+    return -1;
+}
+
+
+//
+// Controller reset
+//
+//
+//   1. Halt: clear USBCMD.RS, then poll USBSTS.HCH until it sets.
+//   2. Reset: set USBCMD.HCRST. The bit self-clears when reset is done.
+//      USBSTS.CNR must also clear before any other operational-register access.
+//   3. Re-read capabilities
+//
+static int xhci_reset(struct xhci_hc *hc) {
+    uint8_t *op = (uint8_t *)hc->op_base;
+
+    // halt the controller if it isn't already.
+    uint32_t cmd = xhci_readl(op + XHCI_OP_USBCMD);
+    if (cmd & XHCI_CMD_RS) {
+        DEBUG("controller running; clearing USBCMD.RS\n");
+        xhci_writel(op + XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RS);
+        if (xhci_poll_until(op + XHCI_OP_USBSTS,
+                            XHCI_STS_HCH, XHCI_STS_HCH,
+                            1000000, "USBSTS.HCH (halt)") < 0) {
+            return -1;
+        }
+    } else {
+        DEBUG("controller already halted (USBSTS.HCH=%u)\n",
+              !!(xhci_readl(op + XHCI_OP_USBSTS) & XHCI_STS_HCH));
+    }
+
+    // assert HCRST and wait for the self-clear + CNR=0.
+    cmd = xhci_readl(op + XHCI_OP_USBCMD);
+    xhci_writel(op + XHCI_OP_USBCMD, cmd | XHCI_CMD_HCRST);
+
+    if (xhci_poll_until(op + XHCI_OP_USBCMD,
+                        XHCI_CMD_HCRST, 0,
+                        1000000, "USBCMD.HCRST self-clear") < 0) {
+        return -1;
+    }
+    if (xhci_poll_until(op + XHCI_OP_USBSTS,
+                        XHCI_STS_CNR, 0,
+                        1000000, "USBSTS.CNR (controller ready)") < 0) {
+        return -1;
+    }
+
+    INFO("controller reset complete\n");
+
+    // re-read capabilities.
+    return xhci_read_capabilities(hc);
+}
+
+
+//
+// Program CONFIG.MaxSlotsEn
+// tells the controller how many device slots to enable.
+// Must be done after reset and before the controller is started.
+// We enable the maximum the controller advertises (HCSPARAMS1.MaxSlots).
+//
+static int xhci_set_max_slots(struct xhci_hc *hc) {
+    uint8_t *op = (uint8_t *)hc->op_base;
+
+    uint32_t config = xhci_readl(op + XHCI_OP_CONFIG);
+    config = (config & ~XHCI_CONFIG_MAXSLOTSEN_MASK) |
+             (hc->max_slots & XHCI_CONFIG_MAXSLOTSEN_MASK);
+    xhci_writel(op + XHCI_OP_CONFIG, config);
+
+    // Read back and confirm the write actually landed
+    uint32_t after = xhci_readl(op + XHCI_OP_CONFIG) & XHCI_CONFIG_MAXSLOTSEN_MASK;
+    if (after != hc->max_slots) {
+        ERROR("MaxSlotsEn write did not stick (wrote=%u read=%u)\n",
+              hc->max_slots, after);
+        return -1;
+    }
+    INFO("CONFIG.MaxSlotsEn = %u\n", after);
+    return 0;
+}
+
+
+//
 // Per-controller initialization
 //
 
 static int xhci_init(struct xhci_hc *hc) {
+   
     if (xhci_read_capabilities(hc) < 0) {
         return -1;
     }
@@ -98,6 +198,14 @@ static int xhci_init(struct xhci_hc *hc) {
          hc->max_intrs, hc->context_size);
     DEBUG("  HCSPARAMS1=0x%08x HCSPARAMS2=0x%08x HCCPARAMS1=0x%08x\n",
           hc->hcs_params1, hc->hcs_params2, hc->hcc_params1);
+
+    if (xhci_reset(hc) < 0) {
+        return -1;
+    }
+
+    if (xhci_set_max_slots(hc) < 0) {
+        return -1;
+    }
 
     return 0;
 }
