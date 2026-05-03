@@ -181,11 +181,170 @@ static int xhci_set_max_slots(struct xhci_hc *hc) {
 
 
 //
+// Allocate and program the DCBAA (Device Context Base Address Array)
+// xHCI spec § 4.5: a (MaxSlots+1)-entry array of 64-bit physical pointers,
+// 64-byte aligned. Index 0 is reserved (scratchpad pointer or NULL); slots
+// 1..MaxSlots will point to per-device output contexts later.
+//
+static int xhci_setup_dcbaa(struct xhci_hc *hc) {
+    size_t size = (hc->max_slots + 1) * sizeof(uint64_t);
+
+    // kmem_mallocz returns a buddy block; for size > 64B it's at least
+    // 64-byte aligned (alignment == roundup_pow_of_two(size) >= 64).
+    hc->dcbaa = kmem_mallocz(size);
+    if (!hc->dcbaa) {
+        ERROR("cannot allocate DCBAA (%lu bytes)\n", size);
+        return -1;
+    }
+    // NK heap is identity-mapped: kernel-virtual == physical.
+    hc->dcbaa_phys = (uint64_t)hc->dcbaa;
+
+    if (hc->dcbaa_phys & (XHCI_DCBAA_ALIGN - 1)) {
+        ERROR("DCBAA not %u-byte aligned (got 0x%lx)\n",
+              XHCI_DCBAA_ALIGN, hc->dcbaa_phys);
+        kmem_free(hc->dcbaa);
+        hc->dcbaa = NULL;
+        return -1;
+    }
+
+    // DCBAAP is a 64-bit operational register.
+    uint8_t *op = (uint8_t *)hc->op_base;
+    xhci_writeq(op + XHCI_OP_DCBAAP, hc->dcbaa_phys);
+
+    INFO("DCBAA at phys=0x%lx (%lu bytes, %u entries)\n",
+         hc->dcbaa_phys, size, hc->max_slots + 1);
+    return 0;
+}
+
+
+//
+// Allocate scratchpad buffers if the controller requires them
+// xHCI spec § 4.20: HCSPARAMS2.MaxScratchpadBufs encodes how many 4 KB pages
+// of scratch memory the controller wants. If nonzero, allocate an array of
+// physical page addresses and store its phys in DCBAA[0].
+//
+static int xhci_setup_scratchpads(struct xhci_hc *hc) {
+    uint32_t spb = XHCI_HCS2_SPB_MAX(hc->hcs_params2);
+    hc->scratchpad_count = spb;
+
+    if (spb == 0) {
+        DEBUG("no scratchpad buffers required\n");
+        return 0;
+    }
+
+    // Pointer array: one uint64_t per scratchpad page.
+    size_t array_size = spb * sizeof(uint64_t);
+    hc->scratchpad_array = kmem_mallocz(array_size);
+    if (!hc->scratchpad_array) {
+        ERROR("cannot allocate scratchpad pointer array\n");
+        return -1;
+    }
+    hc->scratchpad_array_phys = (uint64_t)hc->scratchpad_array;
+
+    // One 4 KB page per scratchpad slot. Buddy gives 4 KB-aligned blocks
+    // for size==4096 since alignment matches the order.
+    for (uint32_t i = 0; i < spb; i++) {
+        void *page = kmem_mallocz(4096);
+        if (!page) {
+            ERROR("cannot allocate scratchpad %u\n", i);
+            return -1;   // teardown handles partial cleanup
+        }
+        hc->scratchpad_array[i] = (uint64_t)page;
+    }
+
+    // DCBAA[0] points at the scratchpad pointer array (per spec § 6.1).
+    hc->dcbaa[0] = hc->scratchpad_array_phys;
+
+    INFO("allocated %u scratchpad buffer(s), array at 0x%lx\n",
+         spb, hc->scratchpad_array_phys);
+    return 0;
+}
+
+
+//
+// Initialize the command ring and program CRCR
+// xHCI spec § 4.9.3: the command ring is a contiguous TRB array. The last
+// TRB is a LINK pointing back to TRB[0] with TC=1 (toggle cycle on traverse).
+// CRCR holds the ring's physical address and the initial Ring Cycle State.
+//
+static int xhci_init_cmd_ring(struct xhci_hc *hc) {
+    size_t size = XHCI_RING_SIZE * sizeof(struct xhci_trb);
+
+    hc->cmd_ring.trbs = kmem_mallocz(size);
+    if (!hc->cmd_ring.trbs) {
+        ERROR("cannot allocate command ring (%lu bytes)\n", size);
+        return -1;
+    }
+    hc->cmd_ring.trbs_phys = (uint64_t)hc->cmd_ring.trbs;
+
+    if (hc->cmd_ring.trbs_phys & (XHCI_RING_ALIGN - 1)) {
+        ERROR("command ring not %u-byte aligned (got 0x%lx)\n",
+              XHCI_RING_ALIGN, hc->cmd_ring.trbs_phys);
+        kmem_free(hc->cmd_ring.trbs);
+        hc->cmd_ring.trbs = NULL;
+        return -1;
+    }
+
+    // Producer state. Cycle starts at 1 (matches the controller's initial
+    // CCS, which we set via CRCR.RCS=1 below).
+    hc->cmd_ring.enq   = 0;
+    hc->cmd_ring.deq   = 0;
+    hc->cmd_ring.cycle = 1;
+
+    // Last TRB: LINK back to TRB[0] with TC=1 so the controller's CCS
+    // toggles each time it traverses the ring boundary. Cycle bit on the
+    // LINK itself starts at 0 (controller's initial CCS=1, so it won't
+    // traverse here until the driver flips this LINK's cycle bit on the
+    // first ring wrap).
+    struct xhci_trb *link = &hc->cmd_ring.trbs[XHCI_RING_SIZE - 1];
+    link->param   = hc->cmd_ring.trbs_phys;
+    link->status  = 0;
+    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC;
+
+    // CRCR is 64-bit. Bits 6..63 = ring base (already 64B aligned), bit 0 =
+    // RCS (set to 1 so the controller's CCS comes up as 1).
+    uint8_t *op = (uint8_t *)hc->op_base;
+    uint64_t crcr = (hc->cmd_ring.trbs_phys & ~0x3fULL) | XHCI_CRCR_RCS;
+    xhci_writeq(op + XHCI_OP_CRCR, crcr);
+
+    INFO("command ring at phys=0x%lx (%u TRBs, %lu bytes)\n",
+         hc->cmd_ring.trbs_phys, XHCI_RING_SIZE, size);
+    return 0;
+}
+
+
+//
+// Free anything xhci_init may have allocated. Safe to call after a partial
+// init failure -- every free is conditional on the pointer being non-NULL.
+//
+static void xhci_teardown(struct xhci_hc *hc) {
+    if (hc->cmd_ring.trbs) {
+        kmem_free(hc->cmd_ring.trbs);
+        hc->cmd_ring.trbs = NULL;
+    }
+    if (hc->scratchpad_array) {
+        for (uint32_t i = 0; i < hc->scratchpad_count; i++) {
+            if (hc->scratchpad_array[i]) {
+                kmem_free((void *)hc->scratchpad_array[i]);
+                hc->scratchpad_array[i] = 0;
+            }
+        }
+        kmem_free(hc->scratchpad_array);
+        hc->scratchpad_array = NULL;
+    }
+    if (hc->dcbaa) {
+        kmem_free(hc->dcbaa);
+        hc->dcbaa = NULL;
+    }
+}
+
+
+//
 // Per-controller initialization
 //
 
 static int xhci_init(struct xhci_hc *hc) {
-   
+
     if (xhci_read_capabilities(hc) < 0) {
         return -1;
     }
@@ -208,7 +367,23 @@ static int xhci_init(struct xhci_hc *hc) {
         return -1;
     }
 
+    if (xhci_setup_dcbaa(hc) < 0) {
+        goto fail;
+    }
+
+    if (xhci_setup_scratchpads(hc) < 0) {
+        goto fail;
+    }
+
+    if (xhci_init_cmd_ring(hc) < 0) {
+        goto fail;
+    }
+
     return 0;
+
+fail:
+    xhci_teardown(hc);
+    return -1;
 }
 
 
