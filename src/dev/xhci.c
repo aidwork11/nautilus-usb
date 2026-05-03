@@ -118,11 +118,11 @@ static int xhci_reset(struct xhci_hc *hc) {
 
     // halt the controller if it isn't already.
     uint32_t cmd = xhci_readl(op + XHCI_OP_USBCMD);
-    if (cmd & XHCI_CMD_RS) {
+    if (cmd & XHCI_CMD_RS) { // reset
         DEBUG("controller running; clearing USBCMD.RS\n");
         xhci_writel(op + XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RS);
-        if (xhci_poll_until(op + XHCI_OP_USBSTS,
-                            XHCI_STS_HCH, XHCI_STS_HCH,
+        if (xhci_poll_until(op + XHCI_OP_USBSTS, // status
+                            XHCI_STS_HCH, XHCI_STS_HCH, // hch = halt
                             1000000, "USBSTS.HCH (halt)") < 0) {
             return -1;
         }
@@ -137,11 +137,11 @@ static int xhci_reset(struct xhci_hc *hc) {
 
     if (xhci_poll_until(op + XHCI_OP_USBCMD,
                         XHCI_CMD_HCRST, 0,
-                        1000000, "USBCMD.HCRST self-clear") < 0) {
+                        1000000, "USBCMD.HCRST self-clear") < 0) { // spec says the hardware will flip this bit back to 0 once the internal reset is finished
         return -1;
     }
     if (xhci_poll_until(op + XHCI_OP_USBSTS,
-                        XHCI_STS_CNR, 0,
+                        XHCI_STS_CNR, 0, // controller not ready
                         1000000, "USBSTS.CNR (controller ready)") < 0) {
         return -1;
     }
@@ -160,8 +160,9 @@ static int xhci_reset(struct xhci_hc *hc) {
 // We enable the maximum the controller advertises (HCSPARAMS1.MaxSlots).
 //
 static int xhci_set_max_slots(struct xhci_hc *hc) {
-    uint8_t *op = (uint8_t *)hc->op_base;
+    uint8_t *op = (uint8_t *)hc->op_base; 
 
+    // update the config to enable all available slots
     uint32_t config = xhci_readl(op + XHCI_OP_CONFIG);
     config = (config & ~XHCI_CONFIG_MAXSLOTSEN_MASK) |
              (hc->max_slots & XHCI_CONFIG_MAXSLOTSEN_MASK);
