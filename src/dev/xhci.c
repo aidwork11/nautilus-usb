@@ -514,19 +514,9 @@ static int xhci_setup_irq(struct xhci_hc *hc) {
     return 0;
 }
 
-
-//
-// Free anything xhci_init may have allocated. call after a partial init failure
-//
 //
 // Start the controller
-// xHCI spec § 4.2: after reset / DCBAA / rings / interrupter are all set up,
-// flip USBCMD to start running.
-//
-//   USBCMD.RS   = 1  -- run/stop, controller starts processing rings
-//   USBCMD.INTE = 1  -- interrupter enable, lets IMAN.IP propagate to MSI-X
-//   USBCMD.HSEE = 1  -- raise system error on bus / TRB faults (defensive)
-//
+// after reset / DCBAA / rings / interrupter are all set up, flip USBCMD to start running.
 // After RS=1 the controller clears USBSTS.HCH, indicating it is no longer
 // halted. From that point, port-status changes start producing events.
 //
@@ -534,10 +524,10 @@ static int xhci_start(struct xhci_hc *hc) {
     uint8_t *op = (uint8_t *)hc->op_base;
 
     uint32_t cmd = xhci_readl(op + XHCI_OP_USBCMD);
-    cmd |= XHCI_CMD_RS | XHCI_CMD_INTE | XHCI_CMD_HSEE;
+    cmd |= XHCI_CMD_RS | XHCI_CMD_INTE | XHCI_CMD_HSEE; // run/stop, interrupt enable, raise system error on faults
     xhci_writel(op + XHCI_OP_USBCMD, cmd);
 
-    // HCH clears once the controller transitions out of the halted state.
+    // HCH clears once the controller transitions out of the halted state
     if (xhci_poll_until(op + XHCI_OP_USBSTS,
                         XHCI_STS_HCH, 0,
                         1000000, "USBSTS.HCH (running)") < 0) {
@@ -550,7 +540,9 @@ static int xhci_start(struct xhci_hc *hc) {
     return 0;
 }
 
-
+//
+// Free anything xhci_init may have allocated. call after a partial init failure
+//
 static void xhci_teardown(struct xhci_hc *hc) {
     if (hc->event_ring.trbs) {
         kmem_free(hc->event_ring.trbs);
