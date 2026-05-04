@@ -303,17 +303,12 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
 //
 // MSI-X IRQ handler stub
 //
-// Phase 3.8 only wires the interrupt path up; full event-ring drain lives in
-// Phase 7. For now we just acknowledge the interrupt so the controller will
-// fire again later (otherwise IMAN.IP stays asserted and we'd be stuck).
+// acknowledge the interrupt so the controller will fire again later 
+// to be fleshed out later
 //
-//   1. Clear USBSTS.EINT (W1C) -- controller-wide event indicator.
-//   2. Clear IMAN.IP (W1C) on the primary interrupter so a future event can
-//      raise the line again.
-//   3. Send EOI to the LAPIC.
-//
-// Note: writing back the read value of IMAN clears IP (W1C) while leaving IE
-// untouched (since IE is RW and was already 1).
+//   1. Clear USBSTS.EINT (event interrupt) (W1C) -- controller-wide event indicator. something new has been placed on the event ring
+//   2. Clear IMAN.IP (interrupt management - interrupt pending) (W1C) on the primary interrupter so a future event can raise the line again. each interruptor gets its own IMAN reg
+//   3. Send EOI (end of interrupt) to the LAPIC.
 //
 static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
     struct xhci_hc *hc = (struct xhci_hc *)priv;
@@ -321,13 +316,14 @@ static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
     uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
 
     // Ack global event indicator.
+    // EINT is W1C so writing causes the interrupt flag to go low
     xhci_writel(op + XHCI_OP_USBSTS, XHCI_STS_EINT);
 
-    // Ack interrupter pending bit. Read-then-write keeps IE intact.
+    // Ack interrupter pending bit. Clear the pending bit, also W1C. An xHCI controller can have many interruptors so this like the local flag
     uint32_t iman = xhci_readl(ir + XHCI_IR_IMAN);
     xhci_writel(ir + XHCI_IR_IMAN, iman | XHCI_IMAN_IP);
 
-    // TODO Phase 7: drain event ring, dispatch by TRB type, advance ERDP.
+    // TODO rain event ring, dispatch by TRB type, advance ERDP.
 
     apic_do_eoi();
     return 0;
@@ -336,7 +332,6 @@ static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
 
 //
 // Initialize the event ring and ERST (Event Ring Segment Table)
-// xHCI spec § 4.9.4 / § 6.5.
 //
 //   1. Allocate the ERST -- one entry, 16 bytes, 64-byte aligned.
 //   2. Allocate the event ring TRB array (one segment, RING_SIZE TRBs).
