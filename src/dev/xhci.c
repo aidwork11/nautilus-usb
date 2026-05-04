@@ -4,6 +4,9 @@
 #include <nautilus/list.h>
 #include <nautilus/spinlock.h>
 #include <nautilus/naut_string.h>
+#include <nautilus/idt.h>            // idt_find_and_reserve_range
+#include <nautilus/irq.h>            // register_int_handler
+#include <dev/apic.h>                // apic_do_eoi
 #include <dev/pci.h>
 #include <dev/xhci.h>
 
@@ -298,9 +301,253 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
 
 
 //
+// MSI-X IRQ handler stub
+//
+// Phase 3.8 only wires the interrupt path up; full event-ring drain lives in
+// Phase 7. For now we just acknowledge the interrupt so the controller will
+// fire again later (otherwise IMAN.IP stays asserted and we'd be stuck).
+//
+//   1. Clear USBSTS.EINT (W1C) -- controller-wide event indicator.
+//   2. Clear IMAN.IP (W1C) on the primary interrupter so a future event can
+//      raise the line again.
+//   3. Send EOI to the LAPIC.
+//
+// Note: writing back the read value of IMAN clears IP (W1C) while leaving IE
+// untouched (since IE is RW and was already 1).
+//
+static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
+    struct xhci_hc *hc = (struct xhci_hc *)priv;
+    uint8_t *op = (uint8_t *)hc->op_base;
+    uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
+
+    // Ack global event indicator.
+    xhci_writel(op + XHCI_OP_USBSTS, XHCI_STS_EINT);
+
+    // Ack interrupter pending bit. Read-then-write keeps IE intact.
+    uint32_t iman = xhci_readl(ir + XHCI_IR_IMAN);
+    xhci_writel(ir + XHCI_IR_IMAN, iman | XHCI_IMAN_IP);
+
+    // TODO Phase 7: drain event ring, dispatch by TRB type, advance ERDP.
+
+    apic_do_eoi();
+    return 0;
+}
+
+
+//
+// Initialize the event ring and ERST (Event Ring Segment Table)
+// xHCI spec § 4.9.4 / § 6.5.
+//
+//   1. Allocate the ERST -- one entry, 16 bytes, 64-byte aligned.
+//   2. Allocate the event ring TRB array (one segment, RING_SIZE TRBs).
+//   3. Fill ERST[0] = { base = event_ring_phys, size = RING_SIZE }.
+//   4. Program interrupter 0:
+//        ERSTSZ = 1
+//        ERDP   = event_ring_phys
+//        ERSTBA = erst_phys           <-- must be written LAST; this triggers
+//                                         the controller to start using the
+//                                         ERST.
+//        IMOD   = moderation interval (units of 250 ns; 4000 = ~1 ms).
+//        IMAN   = IE bit set.
+//
+// Unlike the command/transfer rings, the event ring has no LINK TRB inside
+// the segment -- segments chain via the ERST itself.
+//
+static int xhci_setup_event_ring(struct xhci_hc *hc) {
+    // ERST: at least 1 entry. We allocate room for one entry; buddy will
+    // round to a power-of-2 block, which gives us the 64-byte alignment
+    // the spec requires.
+    size_t erst_size = sizeof(struct xhci_erst_entry);
+    hc->erst = kmem_mallocz(erst_size);
+    if (!hc->erst) {
+        ERROR("cannot allocate ERST\n");
+        return -1;
+    }
+    hc->erst_phys    = (uint64_t)hc->erst;
+    hc->erst_entries = 1;
+
+    if (hc->erst_phys & (XHCI_ERST_ALIGN - 1)) {
+        ERROR("ERST not %u-byte aligned (got 0x%lx)\n",
+              XHCI_ERST_ALIGN, hc->erst_phys);
+        kmem_free(hc->erst);
+        hc->erst = NULL;
+        return -1;
+    }
+
+    // Event ring TRB array (one segment).
+    size_t ring_bytes = XHCI_RING_SIZE * sizeof(struct xhci_trb);
+    hc->event_ring.trbs = kmem_mallocz(ring_bytes);
+    if (!hc->event_ring.trbs) {
+        ERROR("cannot allocate event ring (%lu bytes)\n", ring_bytes);
+        return -1;
+    }
+    hc->event_ring.trbs_phys = (uint64_t)hc->event_ring.trbs;
+
+    if (hc->event_ring.trbs_phys & (XHCI_RING_ALIGN - 1)) {
+        ERROR("event ring not %u-byte aligned (got 0x%lx)\n",
+              XHCI_RING_ALIGN, hc->event_ring.trbs_phys);
+        return -1;
+    }
+
+    // Consumer state. The controller's producer cycle on the event ring
+    // starts at 1 after reset, so we expect to see cycle=1 on valid events.
+    hc->event_ring.enq   = 0;   // unused on event rings (HW is producer)
+    hc->event_ring.deq   = 0;
+    hc->event_ring.cycle = 1;
+
+    // Fill ERST[0].
+    hc->erst[0].base  = hc->event_ring.trbs_phys;
+    hc->erst[0].size  = XHCI_RING_SIZE;
+    hc->erst[0].rsvd1 = 0;
+    hc->erst[0].rsvd2 = 0;
+
+    // Program interrupter 0. Order: ERSTSZ -> ERDP -> ERSTBA last.
+    uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
+
+    xhci_writel(ir + XHCI_IR_ERSTSZ, hc->erst_entries);
+    xhci_writeq(ir + XHCI_IR_ERDP,   hc->event_ring.trbs_phys);
+    xhci_writeq(ir + XHCI_IR_ERSTBA, hc->erst_phys);
+
+    // Moderation: ~1 ms between back-to-back interrupts (4000 * 250 ns).
+    xhci_writel(ir + XHCI_IR_IMOD, 4000);
+
+    // Enable the interrupter (IE=1, IP starts at 0).
+    xhci_writel(ir + XHCI_IR_IMAN, XHCI_IMAN_IE);
+
+    INFO("event ring at phys=0x%lx (%u TRBs); ERST at 0x%lx\n",
+         hc->event_ring.trbs_phys, XHCI_RING_SIZE, hc->erst_phys);
+    return 0;
+}
+
+
+//
+// Workaround for NK's MSI-X auto-detect on 64-bit BARs
+//
+// pci_msi_x_detect (run during pci_init) bails out if the MSI-X table sits
+// on a 64-bit memory BAR -- its helper pci_msi_x_get_bar_start only handles
+// 32-bit BARs, so it returns NULL and the detect function never sets
+// msix.type = PCI_MSI_X (even though it did successfully find the capability
+// and read its size). xHCI's BAR0 is 64-bit per spec, and that's typically
+// where the MSI-X table lives, so we hit this on every probe.
+//
+// To stay scoped to the xhci driver we don't touch pci.c. Instead, if the
+// auto-detect found the capability (msix.co != 0) but failed to set the
+// type, we re-read the table/PBA pointers ourselves using
+// pci_dev_get_bar_addr (which already handles 64-bit BARs), patch the four
+// fields the auto-detect would have set, and proceed.
+//
+// Returns 0 if MSI-X is now usable, -1 otherwise.
+//
+static int xhci_fixup_msix(struct xhci_hc *hc) {
+    struct pci_dev *pdev = hc->pci_dev;
+
+    if (pdev->msix.type == PCI_MSI_X) {
+        return 0;   // auto-detect already worked
+    }
+    if (pdev->msix.co == 0) {
+        return -1;  // device truly has no MSI-X capability
+    }
+
+    // Re-read the MSI-X capability layout from PCI config space.
+    //   co + 4: Table  - low 3 bits = BAR indicator, rest = byte offset
+    //   co + 8: PBA    - same encoding
+    uint8_t co = pdev->msix.co;
+    uint32_t table = pci_dev_cfg_readl(pdev, co + 4);
+    uint32_t pba   = pci_dev_cfg_readl(pdev, co + 8);
+    uint8_t  table_bar = table & 0x7;
+    uint32_t table_off = table & ~0x7u;
+    uint8_t  pba_bar   = pba & 0x7;
+    uint32_t pba_off   = pba & ~0x7u;
+
+    DEBUG("MSI-X re-detect: table BAR=%u off=0x%x, PBA BAR=%u off=0x%x\n",
+          table_bar, table_off, pba_bar, pba_off);
+
+    if (table_bar > 5 || pba_bar > 5) {
+        ERROR("invalid MSI-X BAR indicators\n");
+        return -1;
+    }
+
+    // pci_dev_get_bar_addr handles 64-bit BARs correctly (it reads the
+    // upper dword of the pair when needed and masks off the type bits).
+    uint64_t table_phys = pci_dev_get_bar_addr(pdev, table_bar);
+    uint64_t pba_phys   = pci_dev_get_bar_addr(pdev, pba_bar);
+    if (!table_phys || !pba_phys) {
+        ERROR("MSI-X table/PBA BAR maps to zero (table=0x%lx pba=0x%lx)\n",
+              table_phys, pba_phys);
+        return -1;
+    }
+
+    // Patch what pci_msi_x_detect should have written. Identity-mapped, so
+    // physical == kernel-virtual.
+    pdev->msix.table   = (pci_msi_x_table_entry_t *)(table_phys + table_off);
+    pdev->msix.pending = (uint64_t *)(pba_phys + pba_off);
+    pdev->msix.type    = PCI_MSI_X;
+
+    DEBUG("MSI-X fixup: table at %p, pending at %p, %u entries\n",
+          pdev->msix.table, pdev->msix.pending, pdev->msix.size);
+    return 0;
+}
+
+
+//
+// Allocate an MSI-X vector and route the primary interrupter to it
+//
+//   1. Reserve 1 IDT vector via idt_find_and_reserve_range.
+//   2. register_int_handler(vec, xhci_irq_handler, hc) -- so an early-firing
+//      interrupt finds a real handler.
+//   3. pci_dev_enable_msi_x(pdev) -- disables legacy IRQ, enables MSI-X
+//      (with all entries still masked).
+//   4. pci_dev_set_msi_x_entry(pdev, 0, vec, target_cpu=0).
+//   5. pci_dev_unmask_msi_x_entry(pdev, 0) -- now interrupts can fire.
+//
+static int xhci_setup_irq(struct xhci_hc *hc) {
+    if (xhci_fixup_msix(hc) != 0) {
+        ERROR("device does not advertise usable MSI-X\n");
+        return -1;
+    }
+
+    ulong_t vec;
+    if (idt_find_and_reserve_range(1, 0, &vec) != 0) {
+        ERROR("cannot reserve an IDT vector\n");
+        return -1;
+    }
+    hc->irq_vec = (int)vec;
+
+    if (register_int_handler((uint16_t)vec, xhci_irq_handler, hc) != 0) {
+        ERROR("register_int_handler(vec=%lu) failed\n", vec);
+        return -1;
+    }
+
+    if (pci_dev_enable_msi_x(hc->pci_dev) != 0) {
+        ERROR("pci_dev_enable_msi_x failed\n");
+        return -1;
+    }
+    if (pci_dev_set_msi_x_entry(hc->pci_dev, 0, (int)vec, 0) != 0) {
+        ERROR("pci_dev_set_msi_x_entry failed\n");
+        return -1;
+    }
+    if (pci_dev_unmask_msi_x_entry(hc->pci_dev, 0) != 0) {
+        ERROR("pci_dev_unmask_msi_x_entry failed\n");
+        return -1;
+    }
+
+    INFO("MSI-X entry 0 -> vector %lu, handler installed\n", vec);
+    return 0;
+}
+
+
+//
 // Free anything xhci_init may have allocated. call after a partial init failure
 //
 static void xhci_teardown(struct xhci_hc *hc) {
+    if (hc->event_ring.trbs) {
+        kmem_free(hc->event_ring.trbs);
+        hc->event_ring.trbs = NULL;
+    }
+    if (hc->erst) {
+        kmem_free(hc->erst);
+        hc->erst = NULL;
+    }
     if (hc->cmd_ring.trbs) {
         kmem_free(hc->cmd_ring.trbs);
         hc->cmd_ring.trbs = NULL;
@@ -359,6 +606,14 @@ static int xhci_init(struct xhci_hc *hc) {
     }
 
     if (xhci_init_cmd_ring(hc) < 0) {
+        goto fail;
+    }
+
+    if (xhci_setup_event_ring(hc) < 0) {
+        goto fail;
+    }
+
+    if (xhci_setup_irq(hc) < 0) {
         goto fail;
     }
 
