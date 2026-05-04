@@ -315,6 +315,11 @@ static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
     uint8_t *op = (uint8_t *)hc->op_base;
     uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
 
+    DEBUG("IRQ vec=%lu USBSTS=0x%08x IMAN=0x%08x\n",
+          (ulong_t)v,
+          xhci_readl(op + XHCI_OP_USBSTS),
+          xhci_readl(ir + XHCI_IR_IMAN));
+
     // Ack global event indicator.
     // EINT is W1C so writing causes the interrupt flag to go low
     xhci_writel(op + XHCI_OP_USBSTS, XHCI_STS_EINT);
@@ -513,6 +518,39 @@ static int xhci_setup_irq(struct xhci_hc *hc) {
 //
 // Free anything xhci_init may have allocated. call after a partial init failure
 //
+//
+// Start the controller
+// xHCI spec § 4.2: after reset / DCBAA / rings / interrupter are all set up,
+// flip USBCMD to start running.
+//
+//   USBCMD.RS   = 1  -- run/stop, controller starts processing rings
+//   USBCMD.INTE = 1  -- interrupter enable, lets IMAN.IP propagate to MSI-X
+//   USBCMD.HSEE = 1  -- raise system error on bus / TRB faults (defensive)
+//
+// After RS=1 the controller clears USBSTS.HCH, indicating it is no longer
+// halted. From that point, port-status changes start producing events.
+//
+static int xhci_start(struct xhci_hc *hc) {
+    uint8_t *op = (uint8_t *)hc->op_base;
+
+    uint32_t cmd = xhci_readl(op + XHCI_OP_USBCMD);
+    cmd |= XHCI_CMD_RS | XHCI_CMD_INTE | XHCI_CMD_HSEE;
+    xhci_writel(op + XHCI_OP_USBCMD, cmd);
+
+    // HCH clears once the controller transitions out of the halted state.
+    if (xhci_poll_until(op + XHCI_OP_USBSTS,
+                        XHCI_STS_HCH, 0,
+                        1000000, "USBSTS.HCH (running)") < 0) {
+        return -1;
+    }
+
+    INFO("controller running (USBCMD=0x%08x USBSTS=0x%08x)\n",
+         xhci_readl(op + XHCI_OP_USBCMD),
+         xhci_readl(op + XHCI_OP_USBSTS));
+    return 0;
+}
+
+
 static void xhci_teardown(struct xhci_hc *hc) {
     if (hc->event_ring.trbs) {
         kmem_free(hc->event_ring.trbs);
@@ -588,6 +626,10 @@ static int xhci_init(struct xhci_hc *hc) {
     }
 
     if (xhci_setup_irq(hc) < 0) {
+        goto fail;
+    }
+
+    if (xhci_start(hc) < 0) {
         goto fail;
     }
 
