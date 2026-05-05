@@ -301,24 +301,17 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
 
 
 //
-// Phase 4: Port management
-//
-// PORTSC mixes plain RW bits (PR, PP, PLS, ...) with RW1C "change" bits
-// (CSC, PEC, PRC, ...). Any read/modify/write of PORTSC must mask off the
-// change bits, otherwise we'd inadvertently clear them just by writing back
-// what we read. PED is also RW1C-to-clear (writing 1 disables the port),
-// so we treat it the same way and never echo it back unintentionally.
+// Port management
 //
 
-// All RW1C bits in PORTSC. Mask these off in any read/modify/write so we
-// don't clear them by accident. To clear specific change bits, use
-// xhci_port_clear_changes().
+// All RW1C bits in PORTSC - Mask these off in any read/modify/write so we
+// don't clear them by accident.
+// portsc = port status and control
 #define XHCI_PORTSC_RW1C_ALL \
         (XHCI_PORTSC_W1C_MASK | XHCI_PORTSC_PED)
 
-// Pointer to PORTSC for `port` (1-indexed; valid range 1..max_ports).
-static inline volatile uint32_t *
-xhci_portsc(struct xhci_hc *hc, uint32_t port) {
+// math helper to get the status/control register for a specific port
+static inline volatile uint32_t * xhci_portsc(struct xhci_hc *hc, uint32_t port) {
     return (volatile uint32_t *)((uint8_t *)hc->op_base + XHCI_OP_PORT_BASE
                                  + (port - 1) * XHCI_OP_PORT_STRIDE
                                  + XHCI_PORT_PORTSC);
@@ -328,36 +321,33 @@ static uint32_t xhci_port_read(struct xhci_hc *hc, uint32_t port) {
     return xhci_readl(xhci_portsc(hc, port));
 }
 
-// Write `val` to PORTSC, defensively stripping RW1C bits so a stale read
-// can't accidentally clear them.
 static void xhci_port_write(struct xhci_hc *hc, uint32_t port, uint32_t val) {
     xhci_writel(xhci_portsc(hc, port), val & ~XHCI_PORTSC_RW1C_ALL);
 }
 
-// Acknowledge the W1C change bits in `change_mask` by writing 1 to them.
-// Other RW1C bits get 0 (preserved). Plain RW bits keep their current
-// values from the read-back.
-static void xhci_port_clear_changes(struct xhci_hc *hc, uint32_t port,
-                                    uint32_t change_mask) {
+// ACK the W1C change bits in `change_mask` by writing 1 to them.
+static void xhci_port_clear_changes(struct xhci_hc *hc, uint32_t port, uint32_t change_mask) {
     uint32_t cur = xhci_port_read(hc, port);
-    uint32_t v = (cur & ~XHCI_PORTSC_RW1C_ALL) |
-                 (change_mask & XHCI_PORTSC_W1C_MASK);
+    uint32_t v = (cur & ~XHCI_PORTSC_RW1C_ALL) | (change_mask & XHCI_PORTSC_W1C_MASK);
     xhci_writel(xhci_portsc(hc, port), v);
 }
 
-// Power on a port if HCCPARAMS1.PPC=1 and PORTSC.PP is currently 0.
-// On controllers without per-port power control, ports come up powered and
-// this is a no-op.
 static int xhci_port_power_on(struct xhci_hc *hc, uint32_t port) {
+    
+    // if 0, the hardware handles power automatically without driver involvement
+    // ppc = port power control
     if (!XHCI_HCC1_PPC(hc->hcc_params1)) {
         return 0;
     }
+
+    // if port power is already on, return success
     uint32_t v = xhci_port_read(hc, port);
     if (v & XHCI_PORTSC_PP) {
         return 0;
     }
+    
     xhci_port_write(hc, port, v | XHCI_PORTSC_PP);
-    udelay(20000);   // ~20ms power-on debounce per USB 2.0 §7.1.7.3
+    udelay(20000);   // ~20ms power-on debounce
     v = xhci_port_read(hc, port);
     if (!(v & XHCI_PORTSC_PP)) {
         ERROR("port %u failed to power on (PORTSC=0x%08x)\n", port, v);
@@ -367,12 +357,11 @@ static int xhci_port_power_on(struct xhci_hc *hc, uint32_t port) {
     return 0;
 }
 
-// Trigger a port reset by setting PORTSC.PR. The controller asserts PRC
-// when reset completes; the IRQ handler picks that up via
-// xhci_handle_port_status_change(). Asynchronous - we do not poll here.
+// Trigger a port reset by setting PORTSC.PR. 
+// Asynchronous - no polling here.
 static int xhci_port_reset(struct xhci_hc *hc, uint32_t port) {
     uint32_t v = xhci_port_read(hc, port);
-    if (!(v & XHCI_PORTSC_CCS)) {
+    if (!(v & XHCI_PORTSC_CCS)) { // current connect status
         DEBUG("port %u: no device connected, skipping reset\n", port);
         return -1;
     }
@@ -381,12 +370,13 @@ static int xhci_port_reset(struct xhci_hc *hc, uint32_t port) {
     return 0;
 }
 
-// React to a PORT_STATUS_CHANGE_EVENT TRB. Decode the affected port from
-// param[31:24], read PORTSC, and dispatch on the change bits that are set.
+// React to a PORT_STATUS_CHANGE_EVENT TRB
+// 1. Decode the affected port from param[31:24]
+// 2. read PORTSC and dispatch on the change bits that are set
 // Each branch acks its own change bit so the interrupter doesn't keep
 // re-firing on it.
-static void xhci_handle_port_status_change(struct xhci_hc *hc,
-                                           struct xhci_trb *trb) {
+static void xhci_handle_port_status_change(struct xhci_hc *hc, struct xhci_trb *trb) {
+    
     uint32_t port = (trb->param >> 24) & 0xff;
     if (port < 1 || port > hc->max_ports) {
         ERROR("PORT_STATUS_CHANGE for invalid port %u\n", port);
@@ -402,19 +392,19 @@ static void xhci_handle_port_status_change(struct xhci_hc *hc,
          !!(psc & XHCI_PORTSC_PR),  !!(psc & XHCI_PORTSC_CSC),
          !!(psc & XHCI_PORTSC_PRC), speed);
 
-    if (psc & XHCI_PORTSC_PRC) {
-        // reset finished; port is ready for slot assignment (Phase 5)
+    if (psc & XHCI_PORTSC_PRC) { // port reset change
+        // reset finished; port is ready for slot assignment
         INFO("port %u: reset complete (speed=%u, PED=%u)\n",
              port, speed, !!(psc & XHCI_PORTSC_PED));
         xhci_port_clear_changes(hc, port, XHCI_PORTSC_PRC);
-        // TODO Phase 5: ENABLE_SLOT + ADDRESS_DEVICE here
+        // TODO 
+        // ENABLE_SLOT + ADDRESS_DEVICE here
     }
 
-    if (psc & XHCI_PORTSC_CSC) {
-        if (psc & XHCI_PORTSC_CCS) {
+    if (psc & XHCI_PORTSC_CSC) { // connect status change
+        if (psc & XHCI_PORTSC_CCS) { // current connect status
             INFO("port %u: device connected\n", port);
             xhci_port_clear_changes(hc, port, XHCI_PORTSC_CSC);
-            // Issue reset; PRC event comes back through this handler
             xhci_port_reset(hc, port);
         } else {
             INFO("port %u: device disconnected\n", port);
@@ -422,20 +412,16 @@ static void xhci_handle_port_status_change(struct xhci_hc *hc,
         }
     }
 
-    // Ack any other change bits we don't specifically handle (PEC, OCC,
-    // PLC, WRC, CEC) so they don't keep firing.
-    uint32_t residual = psc & XHCI_PORTSC_W1C_MASK
-                            & ~(XHCI_PORTSC_CSC | XHCI_PORTSC_PRC);
+    // Ack any other change bits we don't specifically handle so they don't keep firing
+    uint32_t residual = psc & XHCI_PORTSC_W1C_MASK & ~(XHCI_PORTSC_CSC | XHCI_PORTSC_PRC);
     if (residual) {
         DEBUG("port %u: acking residual change bits 0x%08x\n", port, residual);
         xhci_port_clear_changes(hc, port, residual);
     }
 }
 
-// Drain all completed TRBs from the event ring. Walks the ring while the
-// next TRB's cycle bit matches our consumer cycle state, dispatching by
-// TRB type. Always writes ERDP at the end (with EHB=1) to ack the event
-// handler busy bit, even if zero events were processed.
+// Walks the ring while the next TRB's cycle bit match the consumer cycle state
+// writes ERDP at the end (with EHB=1) to ack the event
 static void xhci_drain_event_ring(struct xhci_hc *hc) {
     struct xhci_ring *er = &hc->event_ring;
     uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
@@ -443,9 +429,7 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
 
     while (1) {
         struct xhci_trb *trb = &er->trbs[er->deq];
-        // The xHC writes the cycle bit last; the rmb keeps the compiler
-        // from hoisting later trb->* loads above the cycle check.
-        xhci_rmb();
+        xhci_rmb(); // read memory barrier. cycle check must be last
         uint32_t ctrl = trb->control;
         if ((ctrl & XHCI_TRB_CYCLE) != er->cycle) {
             break;   // hardware hasn't filled this slot yet
@@ -457,15 +441,12 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             xhci_handle_port_status_change(hc, trb);
             break;
         case XHCI_TRB_COMMAND_COMPLETION:
-            DEBUG("event: command completion (cc=%u slot=%u)\n",
-                  XHCI_TRB_GET_COMP(trb->status),
-                  (ctrl >> 24) & 0xff);
-            // TODO Phase 5: signal command waiters
+            DEBUG("event: command completion (cc=%u slot=%u)\n", XHCI_TRB_GET_COMP(trb->status), (ctrl >> 24) & 0xff);
+            // TODO signal command waiters
             break;
         case XHCI_TRB_TRANSFER_EVENT:
-            DEBUG("event: transfer (cc=%u)\n",
-                  XHCI_TRB_GET_COMP(trb->status));
-            // TODO Phase 5+: route to endpoint
+            DEBUG("event: transfer (cc=%u)\n", XHCI_TRB_GET_COMP(trb->status));
+            // TODO route to endpoint
             break;
         default:
             DEBUG("event: type=%u (unhandled)\n", type);
@@ -480,21 +461,17 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
         n++;
     }
 
-    // Update ERDP to current dequeue position; EHB=1 acks event handler
-    // busy (W1C). DESI=0 because we have a single ERST segment.
+    // Update ERDP to current dequeue position
     uint64_t phys = er->trbs_phys + er->deq * sizeof(struct xhci_trb);
-    xhci_writeq(ir + XHCI_IR_ERDP,
-                (phys & XHCI_ERDP_PTR_MASK) | XHCI_ERDP_EHB);
+    // mask off the flags, then set event handler busy (W1C) to tell hardware that processing finished
+    xhci_writeq(ir + XHCI_IR_ERDP, (phys & XHCI_ERDP_PTR_MASK) | XHCI_ERDP_EHB);
 
     if (n > 0) {
         DEBUG("drained %d event(s); deq=%u cycle=%u\n", n, er->deq, er->cycle);
     }
 }
 
-// Power on every root hub port and pick up any devices already connected
-// when the controller started. Ports populated before USBCMD.RS=1 do
-// generally fire a CSC event (QEMU does), but powering up explicitly and
-// kicking reset on any pre-connected port makes startup deterministic.
+// Power on every root hub port and pick up any devices already connected when the controller started
 static void xhci_scan_ports(struct xhci_hc *hc) {
     INFO("scanning %u root hub port(s)\n", hc->max_ports);
     for (uint32_t p = 1; p <= hc->max_ports; p++) {
@@ -509,20 +486,16 @@ static void xhci_scan_ports(struct xhci_hc *hc) {
             xhci_port_clear_changes(hc, p, pending);
         }
 
-        if (v & XHCI_PORTSC_CCS) {
+        if (v & XHCI_PORTSC_CCS) { // current connect status
             INFO("port %u: device already connected at startup\n", p);
             xhci_port_reset(hc, p);
             // Wait for the controller to finish the reset and post PRC.
-            // USB 2 reset is ~10ms on the wire; cap at 100ms.
             xhci_poll_until((void *)xhci_portsc(hc, p),
                             XHCI_PORTSC_PRC, XHCI_PORTSC_PRC,
                             100000, "PORTSC.PRC");
         }
     }
 
-    // Bring-up sanity check: until MSI-X delivery is wired up, drain any
-    // PORT_STATUS_CHANGE events the resets above generated. Exercises
-    // xhci_drain_event_ring and xhci_handle_port_status_change end-to-end.
     xhci_drain_event_ring(hc);
 }
 
@@ -530,8 +503,7 @@ static void xhci_scan_ports(struct xhci_hc *hc) {
 //
 // MSI-X IRQ handler stub
 //
-// acknowledge the interrupt so the controller will fire again later 
-// to be fleshed out later
+// acknowledge the interrupt so the controller will fire again later; to be fleshed out later
 //
 //   1. Clear USBSTS.EINT (event interrupt) (W1C) -- controller-wide event indicator. something new has been placed on the event ring
 //   2. Clear IMAN.IP (interrupt management - interrupt pending) (W1C) on the primary interrupter so a future event can raise the line again. each interruptor gets its own IMAN reg
