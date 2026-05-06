@@ -154,7 +154,6 @@ struct naut_info;
 #define XHCI_PORTSC_DR         (1u << 30)  // device removable
 #define XHCI_PORTSC_WPR        (1u << 31)  // warm port reset (USB3)
 
-// Bits that are W1C: when writing PORTSC, mask these unless ack'ing.
 #define XHCI_PORTSC_W1C_MASK \
         (XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_WRC | \
          XHCI_PORTSC_OCC | XHCI_PORTSC_PRC | XHCI_PORTSC_PLC | \
@@ -324,15 +323,6 @@ enum xhci_completion_code {
 #define XHCI_EP_ID(ep, in)      ((((ep) & 0xf) << 1) | ((in) ? 1 : 0))
 #define XHCI_EP0_ID             1   // control EP0 = doorbell target 1. ID0 reserved for slot context (general info about the device)
 
-/* ------------------------------------------------------------------------ */
-/* Context structures.                                                       */
-/*                                                                           */
-/* The xHCI spec defines a 32-byte context layout (CSZ=0) and a 64-byte      */
-/* layout (CSZ=1).  We define the 32-byte form below; callers that need the  */
-/* 64-byte form should size allocations using `hc->context_size` and index   */
-/* using byte offsets rather than C-array indexing on these structs.         */
-/* ------------------------------------------------------------------------ */
-
 // 32-byte slot context
 struct xhci_slot_ctx {
     uint32_t fields[8];
@@ -436,9 +426,9 @@ struct xhci_ring {
     uint8_t          rsvd[3];
 };
 
-/* ------------------------------------------------------------------------ */
-/* Per-controller state.                                                     */
-/* ------------------------------------------------------------------------ */
+//
+// Per-controller state.
+//
 
 struct xhci_hc {
     // MMIO regions. cap_base is the BAR mapping; the others are derived.
