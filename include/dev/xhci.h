@@ -426,6 +426,18 @@ struct xhci_ring {
     uint8_t          rsvd[3];
 };
 
+// In-flight command tracking. The driver fills cmd_trb_phys before ringing
+// the command doorbell; the event-ring drain matches incoming
+// COMMAND_COMPLETION events back by that physical address and writes
+// completion_code/slot_id, then sets `completed` last.
+struct xhci_cmd_wait {
+    uint64_t            cmd_trb_phys;       // physical addr of the issued command TRB
+    volatile uint8_t    completed;          // 0 -> 1 when event arrives
+    volatile uint8_t    completion_code;    // XHCI_CC_*
+    volatile uint8_t    slot_id;            // for ENABLE_SLOT
+    uint8_t             rsvd;
+};
+
 //
 // Per-controller state.
 //
@@ -465,6 +477,17 @@ struct xhci_hc {
     // Slot tracking, indexed 1..max_slots (index 0 unused).
     struct xhci_device_ctx **device_ctxs;
     struct xhci_input_ctx  **input_ctxs;
+    struct xhci_ring        *ep0_rings;     // EP0 transfer rings, one per slot
+
+    // In-flight command (single in-flight for now). Set by the issuer
+    // before ringing the command doorbell; cleared after completion.
+    volatile struct xhci_cmd_wait *current_cmd;
+
+    // Bitmap of ports whose reset has completed and need Phase 5
+    // enumeration. Set by the port status change handler; processed
+    // after the event-ring drain returns so we never re-enter
+    // xhci_run_command from inside its own polled drain. Bit N = port N.
+    uint64_t            pending_port_enum;
 
     //Synchronization
     spinlock_t           lock;
