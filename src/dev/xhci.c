@@ -739,6 +739,40 @@ static void xhci_process_pending_enumerations(struct xhci_hc *hc) {
     }
 }
 
+// Phase 5.5: ADDRESS_DEVICE.
+//   param   = input context physical address (low 4 bits reserved, must be 0)
+//   control = TRB type | Slot ID in [31:24] | optional BSR (bit 9)
+// With BSR=1 the controller copies the input slot/EP0 contexts into its
+// internal device context and moves the slot to Default state, but does
+// not issue SET_ADDRESS on the wire. That lets us read bMaxPacketSize0
+// from the device descriptor (Phase 5.6) before assigning the address.
+// With BSR=0 the controller additionally emits SET_ADDRESS and the slot
+// transitions to Addressed (used in Phase 5.7).
+static int xhci_address_device(struct xhci_hc *hc, int slot_id, int bsr) {
+    struct xhci_input_ctx *in = hc->input_ctxs[slot_id];
+    if (!in) {
+        ERROR("slot %d: ADDRESS_DEVICE without input context\n", slot_id);
+        return -1;
+    }
+
+    // Identity-mapped: kernel virtual address == physical address. The
+    // input context was allocated XHCI_CTX_ALIGN-aligned so the reserved
+    // low 4 bits of param are already zero.
+    uint64_t param   = (uint64_t)in;
+    uint32_t status  = 0;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_ADDRESS_DEVICE)
+                     | XHCI_TRB_SLOT_ID(slot_id)
+                     | (bsr ? XHCI_TRB_BSR : 0);
+
+    if (xhci_run_command(hc, param, status, control,
+                         NULL, "ADDRESS_DEVICE") < 0) {
+        return -1;
+    }
+
+    INFO("slot %d: ADDRESS_DEVICE (BSR=%d) complete\n", slot_id, bsr);
+    return 0;
+}
+
 static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint32_t psc = xhci_port_read(hc, port);
     uint32_t speed = (psc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
@@ -753,7 +787,12 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     if (xhci_alloc_device_ctx(hc, slot_id) < 0) return -1;
     if (xhci_alloc_input_ctx(hc, slot_id, port, speed) < 0) return -1;
 
-    INFO("port %u enumerated as slot %d (speed=%u); awaiting Phase 5.5 ADDRESS_DEVICE\n",
+    // Phase 5.5: hand the input context to the controller. BSR=1 because
+    // we still want to read bMaxPacketSize0 (Phase 5.6) before letting
+    // the controller assign a USB address on the bus.
+    if (xhci_address_device(hc, slot_id, 1) < 0) return -1;
+
+    INFO("port %u enumerated as slot %d (speed=%u); awaiting Phase 5.6 GET_DESCRIPTOR\n",
          port, slot_id, speed);
     return slot_id;
 }

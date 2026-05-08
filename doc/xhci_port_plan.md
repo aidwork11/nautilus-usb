@@ -474,15 +474,62 @@ obj-$(CONFIG_USB)  += usb.o
 ### T2: QEMU Emulated xHCI
 
 QEMU emulates xHCI via `-device qemu-xhci`. This is the primary development target.
+NK boots from an ISO image (built via `make isoimage`), so we use `-cdrom` rather than
+`-kernel` and capture serial to a file we can grep after the run.
+
+#### Build
 
 ```sh
+make isoimage          # builds nautilus.bin and produces nautilus.iso
+```
+
+If make doesn't pick up source changes (the linker step or ISO step gets skipped),
+delete the bin/iso and rebuild:
+
+```sh
+rm -f nautilus.bin nautilus.iso && make isoimage
+```
+
+#### Run in QEMU
+
+```sh
+# Pre-step: kill any lingering QEMU instance that might still hold the test image lock
+pkill -9 qemu-system-x86_64 2>/dev/null; sleep 1
+
+# Reset the test files
+rm -f /tmp/xhci.log /tmp/usbtest.img && truncate -s 16M /tmp/usbtest.img
+
+# Run with the standard "USB 3 mouse + USB 2 storage" device set we use for Phase 4/5
 qemu-system-x86_64 \
-  -kernel nautilus.bin \
+  -cdrom /home/aidan-workman/nautilus/nautilus.iso \
+  -m 2048 -smp 2 \
+  -serial file:/tmp/xhci.log \
+  -display none \
   -device qemu-xhci,id=xhci \
   -device usb-mouse,bus=xhci.0 \
+  -drive if=none,id=usbdisk,file=/tmp/usbtest.img,format=raw \
   -device usb-storage,bus=xhci.0,drive=usbdisk \
-  -drive if=none,id=usbdisk,file=test.img,format=raw \
-  -serial stdio -m 2G
+  -no-reboot &
+QPID=$!
+sleep 12
+kill $QPID 2>/dev/null
+wait 2>/dev/null
+```
+
+12 seconds is enough for boot + xHCI init + Phase 4 port scan + Phase 5 enumeration.
+Bump it if you're testing something that takes longer (e.g. a full descriptor read).
+
+#### Inspect the log
+
+```sh
+# Quick xHCI-only summary
+grep -E "xhci|port [0-9]|status change|reset complete|drained|ENABLE_SLOT|enumerated" /tmp/xhci.log
+
+# Just see errors
+grep -E "ERROR|timeout" /tmp/xhci.log
+
+# Full output
+cat /tmp/xhci.log
 ```
 
 QEMU xHCI implements the full register interface including PORTSC, command/event rings, and
@@ -496,6 +543,10 @@ TRB completion. It will generate proper port status change events on attach.
 5. ENABLE_SLOT returns slot ID 1
 6. ADDRESS_DEVICE completes with `CompletionCode = 1` (Success)
 7. GET_DESCRIPTOR returns `0x0412` (QEMU's vendor ID) in the device descriptor
+
+**QEMU port layout to expect:** `qemu-xhci` exposes 8 root hub ports. Ports 1-4 are USB 3
+(SuperSpeed, speed=4); ports 5-8 are USB 2 (HighSpeed, speed=3). With the device set above,
+the USB 3 mouse lands on port 2 and the USB 2 storage lands on port 5.
 
 ### T3: NK Shell Commands
 

@@ -232,6 +232,10 @@ struct xhci_trb {
 #define XHCI_TRB_TYPE(t)       (((t) & 0x3fu) << XHCI_TRB_TYPE_SHIFT)
 #define XHCI_TRB_GET_TYPE(c)   (((c) >> XHCI_TRB_TYPE_SHIFT) & 0x3fu)
 
+// Slot ID lives in control[31:24] for slot-targeted commands and events
+#define XHCI_TRB_SLOT_ID(s)    (((s) & 0xffu) << 24)
+#define XHCI_TRB_GET_SLOT(c)   (((c) >> 24) & 0xffu)
+
 // status-field helpers
 #define XHCI_TRB_LEN(s)        ((s) & 0x1ffff)
 #define XHCI_TRB_TD_SIZE(n)    (((n) & 0x1f) << 17)
