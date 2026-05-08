@@ -410,7 +410,7 @@ struct xhci_erst_entry {
 // Software ring tracking
 //
 
-#define XHCI_RING_SIZE          256   /* TRBs per ring segment              */
+#define XHCI_RING_SIZE          256   // TRBs per ring segment 
 #define XHCI_DCBAA_ALIGN        64
 #define XHCI_RING_ALIGN         64
 #define XHCI_CTX_ALIGN          64
@@ -479,14 +479,12 @@ struct xhci_hc {
     struct xhci_input_ctx  **input_ctxs;
     struct xhci_ring        *ep0_rings;     // EP0 transfer rings, one per slot
 
-    // In-flight command (single in-flight for now). Set by the issuer
-    // before ringing the command doorbell; cleared after completion.
+    // In-flight command (TODO, single in-flight right now).
+    // Set by the issuer before ringing the command doorbell, cleared after completion
     volatile struct xhci_cmd_wait *current_cmd;
 
-    // Bitmap of ports whose reset has completed and need Phase 5
-    // enumeration. Set by the port status change handler; processed
-    // after the event-ring drain returns so we never re-enter
-    // xhci_run_command from inside its own polled drain. Bit N = port N.
+    // Bitmap of ports whose reset has completed and need enumeration. 
+    // Bit N = port N.
     uint64_t            pending_port_enum;
 
     //Synchronization
@@ -498,7 +496,7 @@ struct xhci_hc {
     // Backing PCI device
     struct pci_dev      *pci_dev;
 
-    /* Linkage on the driver's controller list (internal). */
+    // Linkage on the driver's controller list
     struct list_head     node;
 };
 
