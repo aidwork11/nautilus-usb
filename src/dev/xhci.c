@@ -299,17 +299,13 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
     return 0;
 }
 
-
-// Forward declarations: the Phase 4 port handler calls into Phase 5
-// enumeration, which calls back into the event-ring drain to poll for
-// command completion. Both ends of that cycle need decls.
-static void xhci_drain_event_ring(struct xhci_hc *hc);
-static int  xhci_enumerate_port(struct xhci_hc *hc, uint32_t port);
-static void xhci_process_pending_enumerations(struct xhci_hc *hc);
-
 //
 // Port management
 //
+
+static void xhci_drain_event_ring(struct xhci_hc *hc);
+static int  xhci_enumerate_port(struct xhci_hc *hc, uint32_t port);
+static void xhci_process_pending_enumerations(struct xhci_hc *hc);
 
 // All RW1C bits in PORTSC - Mask these off in any read/modify/write so we
 // don't clear them by accident.
@@ -404,10 +400,7 @@ static void xhci_handle_port_status_change(struct xhci_hc *hc, struct xhci_trb *
         INFO("port %u: reset complete (speed=%u, PED=%u)\n",
              port, speed, !!(psc & XHCI_PORTSC_PED));
         xhci_port_clear_changes(hc, port, XHCI_PORTSC_PRC);
-        // Defer Phase 5 enumeration. We're inside the event-ring drain;
-        // running commands from here would re-enter xhci_run_command's
-        // polled drain and clobber hc->current_cmd. The drain's caller
-        // walks pending_port_enum after we return.
+        // at this port to the bitmap. technically could have up to 255 ports, but realistically this will be fine
         if (port < 64) {
             hc->pending_port_enum |= (1ULL << port);
         }
@@ -440,7 +433,7 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
     int n = 0;
 
     while (1) {
-        struct xhci_trb *trb = &er->trbs[er->deq];
+        struct xhci_trb *trb = &er->trbs[er->deq]; // get current trb
         xhci_rmb(); // read memory barrier. cycle check must be last
         uint32_t ctrl = trb->control;
         if ((ctrl & XHCI_TRB_CYCLE) != er->cycle) {
@@ -456,12 +449,13 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             // The event's param holds the physical address of the command
             // TRB that produced this completion. Match it against the
             // currently in-flight waiter (single-slot for now).
-            uint8_t cc  = XHCI_TRB_GET_COMP(trb->status);
-            uint8_t sid = (ctrl >> 24) & 0xff;
+            uint8_t cc  = XHCI_TRB_GET_COMP(trb->status); // completion code
+            uint8_t sid = (ctrl >> 24) & 0xff; // slot id
             DEBUG("event: command completion (cc=%u slot=%u trb=0x%lx)\n",
                   cc, sid, trb->param);
             volatile struct xhci_cmd_wait *w = hc->current_cmd;
-            if (w && w->cmd_trb_phys == trb->param) {
+            if (w && w->cmd_trb_phys == trb->param) { // if there is a command in flight and if the waiter is waiting for this specific command
+                // the issuer is waiting on .completed. when it sees that going high, it reads the cc and sid
                 w->completion_code = cc;
                 w->slot_id         = sid;
                 xhci_wmb();
@@ -478,7 +472,7 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             break;
         }
 
-        er->deq++;
+        er->deq++; // advance on the ring
         if (er->deq == XHCI_RING_SIZE) {
             er->deq = 0;
             er->cycle ^= 1;
@@ -523,9 +517,9 @@ static void xhci_scan_ports(struct xhci_hc *hc) {
 
     xhci_drain_event_ring(hc);
 
-    // Phase 5: now that drain has marked any reset-complete ports in
-    // pending_port_enum, run their enumerations sequentially. Each
-    // enumeration may trigger more events (command completions); a
+    // now that drain has marked any reset-complete ports in
+    // pending_port_enum, run their enumerations sequentially.
+    // Each enumeration may trigger more events (command completions); a
     // final drain after picks them up.
     xhci_process_pending_enumerations(hc);
     xhci_drain_event_ring(hc);
@@ -533,42 +527,40 @@ static void xhci_scan_ports(struct xhci_hc *hc) {
 
 
 //
-// Phase 5.1-5.3: device enumeration up through input-context setup.
+// device enumeration up through input-context setup
 //
-// After a port reset completes, the controller has trained the link and
+// After a port reset completes, the controller has trained the link (done in hardware) and
 // the port reports a valid speed. The driver then:
-//   5.1  ENABLE_SLOT command -> controller picks a slot ID
-//   5.2  allocate output device context, register in DCBAA[slot_id]
-//   5.3  allocate input context + EP0 transfer ring, populate slot+EP0
-// 5.5+ (ADDRESS_DEVICE, GET_DESCRIPTOR, SET_ADDRESS, ...) come later.
+//   1) ENABLE_SLOT command -> controller picks a slot ID
+//   2) allocate output device context, register in DCBAA[slot_id]
+//   3) allocate input context + EP0 transfer ring, populate slot+EP0
+//   TODO: ADDRESS_DEVICE, GET_DESCRIPTOR, SET_ADDRESS, ...
 //
 
-// Default EP0 max packet size by USB speed. Used for the initial setup;
-// the driver re-evaluates after reading bMaxPacketSize0 from the device
-// descriptor (Phase 5.6).
+// USB spec mandates max packet sizes for EP0 based on bus speed
+// Idea is two fold: 1) slower speed means more wire time + overhead from packet headers,
+// 2) low speed devices tend to be cheaper and have smaller buffers anyways
+// For non EP0 endpoints, the packet size can be different, but the speed sets an upper bound
 static uint16_t xhci_default_ep0_pkt_size(uint32_t speed) {
     switch (speed) {
     case XHCI_SPEED_LS:  return 8;
-    case XHCI_SPEED_FS:  return 8;     // 8 initially; may grow to 64 post-descriptor
+    case XHCI_SPEED_FS:  return 8; // start at 8, but byte7 is bMaxPacketSize0 which could tell us to go up to 64 max
     case XHCI_SPEED_HS:  return 64;
-    case XHCI_SPEED_SS:
+    case XHCI_SPEED_SS:  return 512;
     case XHCI_SPEED_SSP: return 512;
     default:             return 8;
     }
 }
 
 // Enqueue one TRB on the command ring and return its physical address
-// (used by the caller to match the resulting COMMAND_COMPLETION event).
-// Handles wrap: when the next slot would be the LINK at index N-1, mark
-// the LINK with the current cycle so HW follows it, then wrap and toggle
-// our software cycle.
-static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param,
-                                 uint32_t status, uint32_t control) {
+// Handles LINK trbs.
+static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param, uint32_t status, uint32_t control) {
     struct xhci_ring *r = &hc->cmd_ring;
 
+    // if we reached the end of the ring, loop back around before writing anything
     if (r->enq == XHCI_RING_SIZE - 1) {
         struct xhci_trb *link = &r->trbs[XHCI_RING_SIZE - 1];
-        uint32_t lc = (link->control & ~XHCI_TRB_CYCLE) | (r->cycle & 1);
+        uint32_t lc = (link->control & ~XHCI_TRB_CYCLE) | (r->cycle & 1); // isolate the existing cycle bit and OR in the current cycle bit
         xhci_wmb();
         link->control = lc;
         r->enq = 0;
@@ -578,8 +570,7 @@ static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param,
     struct xhci_trb *trb = &r->trbs[r->enq];
     trb->param  = param;
     trb->status = status;
-    // Cycle bit goes in control's LSB. Set it last (with a wmb) so HW
-    // never sees a partially-written TRB.
+    // wmb so HW never sees a partially-written trb
     uint32_t ctl = (control & ~XHCI_TRB_CYCLE) | (r->cycle & 1);
     xhci_wmb();
     trb->control = ctl;
@@ -589,27 +580,23 @@ static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param,
     return trb_phys;
 }
 
-// Issue a command and wait for its COMMAND_COMPLETION_EVENT.
-// Polls the event ring until the matching event arrives or timeout.
+// Issue a command and wait for its COMMAND_COMPLETION_EVENT on the event ring
 // On success, returns 0 and writes the slot id (if non-NULL) from the
 // event's slot field.
-static int xhci_run_command(struct xhci_hc *hc,
-                            uint64_t param, uint32_t status, uint32_t control,
-                            uint8_t *out_slot_id, const char *what) {
+static int xhci_run_command(struct xhci_hc *hc, uint64_t param, uint32_t status, uint32_t control, uint8_t *out_slot_id, const char *what) {
     struct xhci_cmd_wait wait;
     memset(&wait, 0, sizeof(wait));
 
     wait.cmd_trb_phys = xhci_cmd_enqueue(hc, param, status, control);
     hc->current_cmd = &wait;
 
-    // Order: TRB write -> doorbell write. wmb prevents the doorbell
-    // from racing past the TRB store.
+    // Order: TRB write -> doorbell write. wmb prevents the doorbell from racing past the TRB store.
     xhci_wmb();
     xhci_writel(&hc->db_base[XHCI_DB_HOST], XHCI_DB_CMD_DOORBELL);
 
     int timeout_ms = 1000;
     while (!wait.completed && timeout_ms > 0) {
-        xhci_drain_event_ring(hc);
+        xhci_drain_event_ring(hc); // this will resolve the waiter (single threaded)
         if (wait.completed) break;
         udelay(1000);
         timeout_ms--;
@@ -628,13 +615,10 @@ static int xhci_run_command(struct xhci_hc *hc,
     return 0;
 }
 
-// Phase 5.1: ENABLE_SLOT. Returns the slot id (1..max_slots) the
-// controller picked, or -1 on failure.
+// returns the slot ID that the controller picked for this device
 static int xhci_enable_slot(struct xhci_hc *hc) {
     uint8_t slot_id = 0;
-    if (xhci_run_command(hc, 0, 0,
-                         XHCI_TRB_TYPE(XHCI_TRB_ENABLE_SLOT),
-                         &slot_id, "ENABLE_SLOT") < 0) {
+    if (xhci_run_command(hc, 0, 0, XHCI_TRB_TYPE(XHCI_TRB_ENABLE_SLOT), &slot_id, "ENABLE_SLOT") < 0) {
         return -1;
     }
     if (slot_id < 1 || slot_id > hc->max_slots) {
@@ -645,10 +629,6 @@ static int xhci_enable_slot(struct xhci_hc *hc) {
     return (int)slot_id;
 }
 
-// Phase 5.2: allocate the output device context (1 slot + 31 EP, each
-// `context_size` bytes), register its physical address in DCBAA[slot_id].
-// The buddy returns blocks naturally aligned to their (rounded) size,
-// so a 1024-byte alloc gives 1024-byte alignment >= the 64 we need.
 static int xhci_alloc_device_ctx(struct xhci_hc *hc, int slot_id) {
     size_t size = 32 * hc->context_size;        // 1024 bytes for CSZ=0
     struct xhci_device_ctx *ctx = kmem_mallocz(size);
@@ -672,18 +652,13 @@ static int xhci_alloc_device_ctx(struct xhci_hc *hc, int slot_id) {
     return 0;
 }
 
-// Phase 5.3: allocate the input context and the per-slot EP0 transfer
+// allocate the input context and the per-slot EP0 transfer
 // ring, then fill in:
 //   - input control: add_flags = slot | EP0
 //   - slot context:  route=0, port, speed, ctx_entries=1
 //   - EP0 context:   ep_type=Control, max_pkt by speed, TR deq ptr, CErr=3
-// The ADDRESS_DEVICE command in Phase 5.5 will hand this input context
-// to the controller, which copies the relevant fields into the output
-// device context.
-static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
-                                uint32_t port, uint32_t speed) {
-    // Input context = 1 input control ctx + 32 device contexts.
-    // For CSZ=0: 33 * 32 = 1056 bytes (buddy rounds to 2048).
+static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id, uint32_t port, uint32_t speed) {
+    // input context = 1 input control ctx + 1 slot context + ep0 context + 30 other endpoint contexts
     size_t in_size = 33 * hc->context_size;
     struct xhci_input_ctx *in = kmem_mallocz(in_size);
     if (!in) {
@@ -697,7 +672,6 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
         return -1;
     }
 
-    // EP0 transfer ring. RING_SIZE TRBs, contiguous, LINK at end.
     size_t ring_bytes = XHCI_RING_SIZE * sizeof(struct xhci_trb);
     struct xhci_trb *trbs = kmem_mallocz(ring_bytes);
     if (!trbs) {
@@ -713,13 +687,12 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
         return -1;
     }
 
-    // LINK TRB at slot N-1 wraps the ring; TC=1 toggles cycle on traverse.
+    // LINK TRB
     struct xhci_trb *link = &trbs[XHCI_RING_SIZE - 1];
-    link->param   = (uint64_t)trbs;
+    link->param   = (uint64_t)trbs; // link back to the first slot
     link->status  = 0;
-    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC;
+    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC; // TC = toggle cycle
 
-    // Driver-side ring state mirrors the per-controller layout.
     struct xhci_ring *ring = &hc->ep0_rings[slot_id];
     ring->trbs      = trbs;
     ring->trbs_phys = (uint64_t)trbs;
@@ -727,31 +700,24 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
     ring->deq       = 0;
     ring->cycle     = 1;
 
-    // Input control context: tell the controller "apply slot + EP0."
     in->ctrl.add_flags  = XHCI_INPUT_A0_SLOT | XHCI_INPUT_A_EP(XHCI_EP0_ID);
     in->ctrl.drop_flags = 0;
 
-    // Slot context.
-    //   DW0: route=0, speed in [23:20], context_entries=1 in [31:27]
-    //   DW1: root_hub_port_number in [23:16]
-    in->device.slot.fields[0] =
-        ((speed << XHCI_SLOT_DW0_SPEED_SHIFT) & XHCI_SLOT_DW0_SPEED_MASK) |
-        ((1u    << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT)
-                  & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
-    in->device.slot.fields[1] =
-        ((port  << XHCI_SLOT_DW1_RH_PORT_SHIFT) & XHCI_SLOT_DW1_RH_PORT_MASK);
+    // Slot context
+    // route = 0 for now (TODO) as hubs arent supported
+    // lots of other to-dos here
+    in->device.slot.fields[0] = ((speed << XHCI_SLOT_DW0_SPEED_SHIFT) & XHCI_SLOT_DW0_SPEED_MASK) | ((1u << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT) & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
+    in->device.slot.fields[1] = ((port  << XHCI_SLOT_DW1_RH_PORT_SHIFT) & XHCI_SLOT_DW1_RH_PORT_MASK);
 
-    // EP0 context (index 1 = the bidirectional control EP).
-    //   DW1: ep_type=Control, CErr=3, max_packet_size by speed
-    //   DW2/DW3: TR Dequeue Pointer (64-bit) | DCS=1 (initial cycle)
+    // EP0 context
     uint16_t max_pkt = xhci_default_ep0_pkt_size(speed);
     struct xhci_ep_ctx *ep0 = &in->device.ep[XHCI_EP0_ID];
     ep0->fields[1] =
         (XHCI_EP_TYPE_CONTROL << XHCI_EP_DW1_EP_TYPE_SHIFT) |
-        (3u                   << XHCI_EP_DW1_CERR_SHIFT) |
+        (3u                   << XHCI_EP_DW1_CERR_SHIFT) | // retry count on error
         ((uint32_t)max_pkt    << XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT);
 
-    uint64_t deq = ring->trbs_phys | XHCI_EP_DCS;
+    uint64_t deq = ring->trbs_phys | XHCI_EP_DCS; // page aligned, so bottom bits are zeroed. OR in the cycle state
     ep0->fields[2] = (uint32_t)(deq & 0xffffffffu);
     ep0->fields[3] = (uint32_t)(deq >> 32);
 
@@ -762,15 +728,9 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
     return 0;
 }
 
-// Walk pending_port_enum, enumerating each marked port one at a time.
-// Called from drain consumers (scan_ports for boot, IRQ handler for
-// hot-plug) after the drain returns so that command issuance never
-// nests inside a polled drain. xhci_enumerate_port itself calls drain
-// while waiting for ENABLE_SLOT - that's fine because no other
-// enumeration is in flight at that moment.
+// enumerate ports one at a time
 static void xhci_process_pending_enumerations(struct xhci_hc *hc) {
     while (hc->pending_port_enum) {
-        // ffsll returns 1-indexed bit position, 0 if none.
         int bit = __builtin_ffsll((long long)hc->pending_port_enum) - 1;
         if (bit < 0) break;
         uint32_t port = (uint32_t)bit;
@@ -779,11 +739,6 @@ static void xhci_process_pending_enumerations(struct xhci_hc *hc) {
     }
 }
 
-// Drives the 5.1 -> 5.2 -> 5.3 chain for one freshly-reset port.
-// On success, the controller has a slot allocated and the driver has
-// per-slot device + input contexts and an EP0 ring ready to use; the
-// next step (Phase 5.5) is ADDRESS_DEVICE to actually push the input
-// context into the controller's view of the slot.
 static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint32_t psc = xhci_port_read(hc, port);
     uint32_t speed = (psc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
@@ -1078,7 +1033,8 @@ static void xhci_teardown(struct xhci_hc *hc) {
         kmem_free(hc->dcbaa);
         hc->dcbaa = NULL;
     }
-    // Phase 5: per-slot device/input contexts and EP0 rings.
+    
+    // per-slot device/input contexts and EP0 rings.
     if (hc->device_ctxs) {
         for (uint32_t i = 1; i <= hc->max_slots; i++) {
             if (hc->device_ctxs[i]) {
@@ -1140,13 +1096,7 @@ static int xhci_init(struct xhci_hc *hc) {
         return -1;
     }
 
-    // Phase 5 driver state: per-slot tracking arrays and an EP0 ring slot
-    // for each slot id 1..max_slots. Index 0 is unused.
     if (hc->context_size != 32) {
-        // The xhci_device_ctx / xhci_input_ctx structs in xhci.h are sized
-        // for 32-byte contexts. CSZ=1 controllers are valid per spec but
-        // would need byte-offset indexing throughout - not worth supporting
-        // until we hit one in QEMU or on real hw.
         ERROR("64-byte context size not supported (CSZ=1)\n");
         return -1;
     }
