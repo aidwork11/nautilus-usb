@@ -463,10 +463,27 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             }
             break;
         }
-        case XHCI_TRB_TRANSFER_EVENT:
-            DEBUG("event: transfer (cc=%u)\n", XHCI_TRB_GET_COMP(trb->status));
-            // TODO route to endpoint
+        case XHCI_TRB_TRANSFER_EVENT: {
+            // For TRANSFER_EVENT, status[31:24] = completion code,
+            // status[23:0] = bytes NOT transferred (residual). control
+            // carries the slot id (31:24) and ep id (20:16) of the EP
+            // that produced the event. param = phys addr of the source
+            // TRB (or event-data, but we don't use Event Data TRBs).
+            uint8_t  cc       = XHCI_TRB_GET_COMP(trb->status);
+            uint8_t  sid      = XHCI_TRB_GET_SLOT(ctrl);
+            uint8_t  eid      = XHCI_TRB_GET_EP(ctrl);
+            uint32_t residual = trb->status & 0xffffffu;
+            DEBUG("event: transfer (cc=%u slot=%u ep=%u resid=%u trb=0x%lx)\n",
+                  cc, sid, eid, residual, trb->param);
+            volatile struct xhci_xfer_wait *w = hc->current_xfer;
+            if (w && w->slot_id == sid && w->ep_id == eid) {
+                w->completion_code = cc;
+                w->residual_len    = residual;
+                xhci_wmb();
+                w->completed       = 1;
+            }
             break;
+        }
         default:
             DEBUG("event: type=%u (unhandled)\n", type);
             break;
@@ -710,8 +727,11 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id, uint32_t port, 
     in->device.slot.fields[1] = ((port  << XHCI_SLOT_DW1_RH_PORT_SHIFT) & XHCI_SLOT_DW1_RH_PORT_MASK);
 
     // EP0 context
+    // The DCI for the bidirectional control EP is 1, but in struct
+    // xhci_device_ctx the slot ctx (DCI 0) is its own field and ep[]
+    // starts at DCI 1, so EP0's context lives at ep[0] (DCI - 1).
     uint16_t max_pkt = xhci_default_ep0_pkt_size(speed);
-    struct xhci_ep_ctx *ep0 = &in->device.ep[XHCI_EP0_ID];
+    struct xhci_ep_ctx *ep0 = &in->device.ep[XHCI_EP0_ID - 1];
     ep0->fields[1] =
         (XHCI_EP_TYPE_CONTROL << XHCI_EP_DW1_EP_TYPE_SHIFT) |
         (3u                   << XHCI_EP_DW1_CERR_SHIFT) | // retry count on error
@@ -761,6 +781,157 @@ static int xhci_address_device(struct xhci_hc *hc, int slot_id, int bsr) {
     return 0;
 }
 
+
+//
+// Phase 5.6: control-transfer plumbing on EP0
+//
+// A control transfer is a 3-TRB TD on an EP transfer ring:
+//   SETUP  - 8-byte USB setup packet, IDT=1 so the bytes live in the TRB itself
+//   DATA   - optional, points to the IN/OUT data buffer
+//   STATUS - zero-length opposite-direction stage, IOC=1 so we get one event
+// The TD must live on a single contiguous segment, so we wrap up front
+// if it wouldn't fit before the ring's LINK TRB.
+//
+
+// Wrap a transfer ring so a TD of n_trbs fits before the LINK TRB
+// at index RING_SIZE-1. enq is allowed to point at slots 0..RING_SIZE-2;
+// the LINK occupies the final slot. If fewer than n_trbs slots remain,
+// flip the LINK's cycle to current and reset enq to 0 (toggling our cycle)
+static void xhci_ring_reserve(struct xhci_ring *r, uint32_t n_trbs) {
+    uint32_t avail = (XHCI_RING_SIZE - 1) - r->enq;
+    if (avail >= n_trbs) {
+        return;
+    }
+    struct xhci_trb *link = &r->trbs[XHCI_RING_SIZE - 1];
+    uint32_t lc = (link->control & ~XHCI_TRB_CYCLE) | (r->cycle & 1);
+    xhci_wmb();
+    link->control = lc;
+    r->enq = 0;
+    r->cycle ^= 1;
+}
+
+// Enqueue one TRB on an arbitrary transfer ring; returns the physical
+// address of the TRB just written. Caller is responsible for ensuring
+// space (xhci_ring_reserve) before placing the first TRB of a TD.
+static uint64_t xhci_xfer_enqueue(struct xhci_ring *r, uint64_t param,
+                                  uint32_t status, uint32_t control) {
+    struct xhci_trb *trb = &r->trbs[r->enq];
+    trb->param  = param;
+    trb->status = status;
+    uint32_t ctl = (control & ~XHCI_TRB_CYCLE) | (r->cycle & 1);
+    xhci_wmb();
+    trb->control = ctl;
+
+    uint64_t trb_phys = r->trbs_phys + r->enq * sizeof(struct xhci_trb);
+    r->enq++;
+    return trb_phys;
+}
+
+// Issue one USB control transfer on a slot's EP0 ring and wait for its
+// TRANSFER_EVENT. Buffer is identity-mapped (phys == virt) and small
+// enough to live within a single 64KB region. wLength must fit in the
+// 17-bit TRB transfer length field.
+//
+// Returns bytes actually transferred on success (possibly < wLength on
+// short packet), or -1 on timeout / non-success completion code.
+static int xhci_control_transfer(struct xhci_hc *hc, int slot_id,
+                                 uint8_t bmRequestType, uint8_t bRequest,
+                                 uint16_t wValue, uint16_t wIndex,
+                                 void *buf, uint16_t wLength) {
+    struct xhci_ring *r = &hc->ep0_rings[slot_id];
+    int dir_in   = (bmRequestType & USB_DIR_IN) != 0;
+    int has_data = wLength > 0;
+    uint32_t n_trbs = has_data ? 3u : 2u;
+
+    // Reserve segment space for the whole TD so it doesn't straddle LINK.
+    xhci_ring_reserve(r, n_trbs);
+
+    // SETUP: 8-byte USB setup packet packed into param + status.
+    // bmRequestType=byte0, bRequest=byte1, wValue=bytes2-3, wIndex=bytes4-5,
+    // wLength=bytes6-7 (all little-endian, which matches x86_64 native).
+    uint64_t setup_param =
+          ((uint64_t)bmRequestType)
+        | ((uint64_t)bRequest    << 8)
+        | ((uint64_t)wValue      << 16)
+        | ((uint64_t)wIndex      << 32)
+        | ((uint64_t)wLength     << 48);
+    uint32_t setup_status = 8;   // TRB Transfer Length = 8 bytes (the setup packet)
+    uint32_t setup_trt    = !has_data ? XHCI_TRB_SETUP_TRT_NO_DATA
+                                      : (dir_in ? XHCI_TRB_SETUP_TRT_IN
+                                                : XHCI_TRB_SETUP_TRT_OUT);
+    uint32_t setup_ctl = XHCI_TRB_TYPE(XHCI_TRB_SETUP_STAGE)
+                       | XHCI_TRB_IDT
+                       | setup_trt;
+    xhci_xfer_enqueue(r, setup_param, setup_status, setup_ctl);
+
+    // DATA (optional): direction bit follows the setup packet's direction.
+    if (has_data) {
+        uint32_t data_ctl = XHCI_TRB_TYPE(XHCI_TRB_DATA_STAGE);
+        if (dir_in) data_ctl |= XHCI_TRB_DIR_IN;
+        xhci_xfer_enqueue(r, (uint64_t)buf, (uint32_t)wLength, data_ctl);
+    }
+
+    // STATUS: opposite direction of data (or IN if no data stage),
+    // zero length, IOC=1 so we get a single completion event.
+    int status_dir_in = !dir_in || !has_data;
+    uint32_t status_ctl = XHCI_TRB_TYPE(XHCI_TRB_STATUS_STAGE) | XHCI_TRB_IOC;
+    if (status_dir_in) status_ctl |= XHCI_TRB_DIR_IN;
+
+    struct xhci_xfer_wait wait;
+    memset(&wait, 0, sizeof(wait));
+    wait.last_trb_phys = xhci_xfer_enqueue(r, 0, 0, status_ctl);
+    wait.slot_id       = (uint8_t)slot_id;
+    wait.ep_id         = XHCI_EP0_ID;
+    hc->current_xfer   = &wait;
+
+    // Order: TRBs written -> doorbell write. wmb so the doorbell
+    // doesn't race past the still-in-flight TRB stores.
+    xhci_wmb();
+    xhci_writel(&hc->db_base[slot_id], XHCI_EP0_ID);
+
+    int timeout_ms = 1000;
+    while (!wait.completed && timeout_ms > 0) {
+        xhci_drain_event_ring(hc);
+        if (wait.completed) break;
+        udelay(1000);
+        timeout_ms--;
+    }
+    hc->current_xfer = NULL;
+
+    if (!wait.completed) {
+        ERROR("control xfer slot=%d: timeout waiting for completion\n", slot_id);
+        return -1;
+    }
+    if (wait.completion_code != XHCI_CC_SUCCESS &&
+        wait.completion_code != XHCI_CC_SHORT_PACKET) {
+        ERROR("control xfer slot=%d: completion code %u\n",
+              slot_id, wait.completion_code);
+        return -1;
+    }
+
+    // residual = bytes the controller did NOT transfer
+    return (int)wLength - (int)wait.residual_len;
+}
+
+// Phase 5.6: GET_DESCRIPTOR(DEVICE). Reads up to `len` bytes of the
+// device descriptor into `buf`. Initial bring-up uses len=8 to discover
+// bMaxPacketSize0; len=18 yields the full descriptor incl. vendor/product.
+static int xhci_get_device_descriptor(struct xhci_hc *hc, int slot_id,
+                                      void *buf, uint16_t len) {
+    int got = xhci_control_transfer(hc, slot_id,
+                                    USB_DIR_IN,           // bmRequestType: device-to-host, standard, device
+                                    USB_REQ_GET_DESCRIPTOR,
+                                    (uint16_t)(USB_DT_DEVICE << 8) | 0,
+                                    0,
+                                    buf, len);
+    if (got < 0) return -1;
+    if (got < (int)len) {
+        DEBUG("slot %d: GET_DESCRIPTOR returned short (%d/%u)\n",
+              slot_id, got, len);
+    }
+    return got;
+}
+
 static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint32_t psc = xhci_port_read(hc, port);
     uint32_t speed = (psc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
@@ -778,7 +949,29 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     // hand the input context to the controller
     if (xhci_address_device(hc, slot_id, 1) < 0) return -1;
 
-    INFO("port %u enumerated as slot %d (speed=%u); awaiting Phase 5.6 GET_DESCRIPTOR\n",
+    // Phase 5.6: read the first 8 bytes of the device descriptor. That
+    // is the standard "discover bMaxPacketSize0" probe; Phase 5.7 will
+    // use it to EVALUATE_CONTEXT (FS path) before issuing the second
+    // ADDRESS_DEVICE with BSR=0 to assign a USB address.
+    uint8_t *desc8 = kmem_mallocz(8);
+    if (!desc8) {
+        ERROR("slot %d: cannot allocate descriptor scratch\n", slot_id);
+        return -1;
+    }
+    int got = xhci_get_device_descriptor(hc, slot_id, desc8, 8);
+    if (got < 0) {
+        kmem_free(desc8);
+        return -1;
+    }
+    INFO("slot %d: dev desc (first %d B) bLength=%u type=%u bcdUSB=0x%04x "
+         "class=%u sub=%u proto=%u maxpkt0=%u\n",
+         slot_id, got,
+         desc8[0], desc8[1],
+         (uint16_t)(desc8[2] | (desc8[3] << 8)),
+         desc8[4], desc8[5], desc8[6], desc8[7]);
+    kmem_free(desc8);
+
+    INFO("port %u enumerated as slot %d (speed=%u); awaiting Phase 5.7 SET_ADDRESS\n",
          port, slot_id, speed);
     return slot_id;
 }

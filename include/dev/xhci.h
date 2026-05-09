@@ -236,6 +236,15 @@ struct xhci_trb {
 #define XHCI_TRB_SLOT_ID(s)    (((s) & 0xffu) << 24)
 #define XHCI_TRB_GET_SLOT(c)   (((c) >> 24) & 0xffu)
 
+// Endpoint ID lives in control[20:16] of TRANSFER_EVENT TRBs
+#define XHCI_TRB_GET_EP(c)     (((c) >> 16) & 0x1fu)
+
+// Setup Stage TRB: TRT field is control[17:16]
+#define XHCI_TRB_SETUP_TRT_SHIFT     16
+#define XHCI_TRB_SETUP_TRT_NO_DATA   (0u << XHCI_TRB_SETUP_TRT_SHIFT)
+#define XHCI_TRB_SETUP_TRT_OUT       (2u << XHCI_TRB_SETUP_TRT_SHIFT)
+#define XHCI_TRB_SETUP_TRT_IN        (3u << XHCI_TRB_SETUP_TRT_SHIFT)
+
 // status-field helpers
 #define XHCI_TRB_LEN(s)        ((s) & 0x1ffff)
 #define XHCI_TRB_TD_SIZE(n)    (((n) & 0x1f) << 17)
@@ -442,6 +451,62 @@ struct xhci_cmd_wait {
     uint8_t             rsvd;
 };
 
+// In-flight transfer tracking. One outstanding control transfer at a
+// time for now; the drain matches incoming TRANSFER_EVENT against
+// (slot_id, ep_id) and copies cc + residual into the wait struct.
+// `last_trb_phys` is the IOC-bearing TRB (STATUS for control xfers);
+// stored mostly for diagnostics — matching is by slot/ep.
+struct xhci_xfer_wait {
+    uint64_t            last_trb_phys;
+    volatile uint8_t    completed;
+    volatile uint8_t    completion_code;
+    uint8_t             slot_id;
+    uint8_t             ep_id;
+    volatile uint32_t   residual_len;       // bytes NOT transferred
+};
+
+//
+// Minimal USB descriptor / request types needed by Phase 5.6.
+// Will move into <dev/usb.h> when the USB core arrives in Phase 6.
+//
+
+#define USB_DIR_IN              0x80
+#define USB_DIR_OUT             0x00
+
+// Standard request codes (bRequest)
+#define USB_REQ_GET_STATUS         0
+#define USB_REQ_CLEAR_FEATURE      1
+#define USB_REQ_SET_FEATURE        3
+#define USB_REQ_SET_ADDRESS        5
+#define USB_REQ_GET_DESCRIPTOR     6
+#define USB_REQ_SET_DESCRIPTOR     7
+#define USB_REQ_GET_CONFIGURATION  8
+#define USB_REQ_SET_CONFIGURATION  9
+
+// Descriptor types (high byte of wValue for GET_DESCRIPTOR)
+#define USB_DT_DEVICE              1
+#define USB_DT_CONFIGURATION       2
+#define USB_DT_STRING              3
+#define USB_DT_INTERFACE           4
+#define USB_DT_ENDPOINT            5
+
+struct usb_device_descriptor {
+    uint8_t  bLength;
+    uint8_t  bDescriptorType;
+    uint16_t bcdUSB;
+    uint8_t  bDeviceClass;
+    uint8_t  bDeviceSubClass;
+    uint8_t  bDeviceProtocol;
+    uint8_t  bMaxPacketSize0;
+    uint16_t idVendor;
+    uint16_t idProduct;
+    uint16_t bcdDevice;
+    uint8_t  iManufacturer;
+    uint8_t  iProduct;
+    uint8_t  iSerialNumber;
+    uint8_t  bNumConfigurations;
+} __attribute__((packed));
+
 //
 // Per-controller state.
 //
@@ -486,6 +551,10 @@ struct xhci_hc {
     // In-flight command (TODO, single in-flight right now).
     // Set by the issuer before ringing the command doorbell, cleared after completion
     volatile struct xhci_cmd_wait *current_cmd;
+
+    // In-flight transfer (single in-flight, mirrors current_cmd).
+    // The drain matches TRANSFER_EVENT to this by (slot_id, ep_id).
+    volatile struct xhci_xfer_wait *current_xfer;
 
     // Bitmap of ports whose reset has completed and need enumeration. 
     // Bit N = port N.
