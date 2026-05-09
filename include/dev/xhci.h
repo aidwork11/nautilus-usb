@@ -206,10 +206,6 @@ struct naut_info;
 // Transfer Request Block layout and type constants
 //
 
-/*
- * Common 16-byte TRB layout. All TRB variants overlay this template; the
- * `control` field's bits 10-15 carry the TRB type and bit 0 is the cycle bit.
- */
 struct xhci_trb {
     uint64_t param;     // address or immediate data
     uint32_t status;    // transfer metadata - how many bytes to transfer, error codes, etc
@@ -239,7 +235,7 @@ struct xhci_trb {
 // Endpoint ID lives in control[20:16] of TRANSFER_EVENT TRBs
 #define XHCI_TRB_GET_EP(c)     (((c) >> 16) & 0x1fu)
 
-// Setup Stage TRB: TRT field is control[17:16]
+// Transfer type
 #define XHCI_TRB_SETUP_TRT_SHIFT     16
 #define XHCI_TRB_SETUP_TRT_NO_DATA   (0u << XHCI_TRB_SETUP_TRT_SHIFT)
 #define XHCI_TRB_SETUP_TRT_OUT       (2u << XHCI_TRB_SETUP_TRT_SHIFT)
@@ -439,10 +435,7 @@ struct xhci_ring {
     uint8_t          rsvd[3];
 };
 
-// In-flight command tracking. The driver fills cmd_trb_phys before ringing
-// the command doorbell; the event-ring drain matches incoming
-// COMMAND_COMPLETION events back by that physical address and writes
-// completion_code/slot_id, then sets `completed` last.
+// In-flight command tracking
 struct xhci_cmd_wait {
     uint64_t            cmd_trb_phys;       // physical addr of the issued command TRB
     volatile uint8_t    completed;          // 0 -> 1 when event arrives
@@ -451,11 +444,7 @@ struct xhci_cmd_wait {
     uint8_t             rsvd;
 };
 
-// In-flight transfer tracking. One outstanding control transfer at a
-// time for now; the drain matches incoming TRANSFER_EVENT against
-// (slot_id, ep_id) and copies cc + residual into the wait struct.
-// `last_trb_phys` is the IOC-bearing TRB (STATUS for control xfers);
-// stored mostly for diagnostics — matching is by slot/ep.
+// In-flight transfer tracking
 struct xhci_xfer_wait {
     uint64_t            last_trb_phys;
     volatile uint8_t    completed;
@@ -466,8 +455,8 @@ struct xhci_xfer_wait {
 };
 
 //
-// Minimal USB descriptor / request types needed by Phase 5.6.
-// Will move into <dev/usb.h> when the USB core arrives in Phase 6.
+// Minimal USB descriptor / request types
+// Will move into <dev/usb.h> when the USB core is set up
 //
 
 #define USB_DIR_IN              0x80
@@ -552,7 +541,7 @@ struct xhci_hc {
     // Set by the issuer before ringing the command doorbell, cleared after completion
     volatile struct xhci_cmd_wait *current_cmd;
 
-    // In-flight transfer (single in-flight, mirrors current_cmd).
+    // In-flight transfer (single in-flight).
     // The drain matches TRANSFER_EVENT to this by (slot_id, ep_id).
     volatile struct xhci_xfer_wait *current_xfer;
 
