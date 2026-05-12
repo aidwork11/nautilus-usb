@@ -563,6 +563,16 @@ static uint16_t xhci_default_ep0_pkt_size(uint32_t speed) {
     }
 }
 
+// Decode bMaxPacketSize0 (descriptor byte 7) into a literal byte count.
+// SS encodes it as an exponent (always 9 -> 512); LS/FS/HS report the
+// literal size (8/16/32/64).
+static uint16_t xhci_decode_max_pkt0(uint32_t speed, uint8_t reported) {
+    if (speed == XHCI_SPEED_SS || speed == XHCI_SPEED_SSP) {
+        return (uint16_t)(1u << reported);
+    }
+    return reported;
+}
+
 // Enqueue one TRB on the command ring and return its physical address
 // Handles LINK trbs.
 static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param, uint32_t status, uint32_t control) {
@@ -758,6 +768,12 @@ static int xhci_address_device(struct xhci_hc *hc, int slot_id, int bsr) {
         return -1;
     }
 
+    // Per spec 6.2.5.1, ADDRESS_DEVICE expects A0 (slot) and A1 (EP0)
+    // both set. Re-assert here so we're idempotent when called after
+    // EVALUATE_CONTEXT (which leaves add_flags = EP0-only).
+    in->ctrl.add_flags  = XHCI_INPUT_A0_SLOT | XHCI_INPUT_A_EP(XHCI_EP0_ID);
+    in->ctrl.drop_flags = 0;
+
     uint64_t param   = (uint64_t)in;
     uint32_t status  = 0;
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_ADDRESS_DEVICE)
@@ -769,6 +785,47 @@ static int xhci_address_device(struct xhci_hc *hc, int slot_id, int bsr) {
     }
 
     INFO("slot %d: ADDRESS_DEVICE (BSR=%d) complete\n", slot_id, bsr);
+    return 0;
+}
+
+// Phase 5.7 helper: EVALUATE_CONTEXT to push a new EP0 max_pkt_size
+// into the controller's output device context. The xHC reads
+// bMaxPacketSize0 from the EP0 context for every control transfer,
+// so this must run before the second ADDRESS_DEVICE if the device
+// reports a value different from the speed-based default. In practice
+// only FS devices need this (HS/SS always match the default).
+static int xhci_evaluate_ep0_max_pkt(struct xhci_hc *hc, int slot_id,
+                                     uint16_t new_max_pkt) {
+    struct xhci_input_ctx *in = hc->input_ctxs[slot_id];
+    if (!in) {
+        ERROR("slot %d: EVALUATE_CONTEXT without input context\n", slot_id);
+        return -1;
+    }
+
+    // For EVALUATE_CONTEXT, only the EP0 bit is set in add_flags. The
+    // input slot context is still read for validation but isn't copied
+    // into the output. xhci_address_device re-asserts the slot+EP0
+    // pair before its next call, so we don't need to restore here.
+    in->ctrl.add_flags  = XHCI_INPUT_A_EP(XHCI_EP0_ID);
+    in->ctrl.drop_flags = 0;
+
+    // Rewrite EP0 fields[1] with the new max_pkt; preserve EP_TYPE/CErr.
+    struct xhci_ep_ctx *ep0 = &in->device.ep[XHCI_EP0_ID - 1];
+    ep0->fields[1] =
+        (XHCI_EP_TYPE_CONTROL  << XHCI_EP_DW1_EP_TYPE_SHIFT) |
+        (3u                    << XHCI_EP_DW1_CERR_SHIFT) |
+        ((uint32_t)new_max_pkt << XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT);
+
+    uint64_t param   = (uint64_t)in;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_EVALUATE_CONTEXT)
+                     | XHCI_TRB_SLOT_ID(slot_id);
+
+    if (xhci_run_command(hc, param, 0, control,
+                         NULL, "EVALUATE_CONTEXT") < 0) {
+        return -1;
+    }
+    INFO("slot %d: EVALUATE_CONTEXT updated EP0 max_pkt to %u\n",
+         slot_id, new_max_pkt);
     return 0;
 }
 
@@ -943,10 +1000,31 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
          desc8[0], desc8[1],
          (uint16_t)(desc8[2] | (desc8[3] << 8)),
          desc8[4], desc8[5], desc8[6], desc8[7]);
+    uint8_t bMaxPacketSize0 = desc8[7];
     kmem_free(desc8);
 
-    INFO("port %u enumerated as slot %d (speed=%u); awaiting Phase 5.7 SET_ADDRESS\n",
-         port, slot_id, speed);
+    // Phase 5.7: if the device's bMaxPacketSize0 doesn't match the
+    // speed-based default we used for the first ADDRESS_DEVICE, push
+    // the corrected value into the EP0 context via EVALUATE_CONTEXT.
+    // Then fire the second ADDRESS_DEVICE with BSR=0 so the controller
+    // emits SET_ADDRESS on the bus and moves the slot to Addressed.
+    uint16_t reported = xhci_decode_max_pkt0(speed, bMaxPacketSize0);
+    uint16_t current  = xhci_default_ep0_pkt_size(speed);
+    if (reported != current && reported >= 8 && reported <= 1024) {
+        DEBUG("slot %d: EP0 max_pkt mismatch (default=%u, device=%u); evaluating\n",
+              slot_id, current, reported);
+        if (xhci_evaluate_ep0_max_pkt(hc, slot_id, reported) < 0) {
+            return -1;
+        }
+    }
+
+    if (xhci_address_device(hc, slot_id, 0) < 0) return -1;
+
+    // After BSR=0 the controller has written the assigned USB device
+    // address into the OUTPUT slot context's DW3 [7:0].
+    uint8_t usb_addr = hc->device_ctxs[slot_id]->slot.fields[3] & 0xff;
+    INFO("port %u enumerated as slot %d (speed=%u, USB addr=%u); awaiting Phase 5.8 GET_DESCRIPTOR (full)\n",
+         port, slot_id, speed, usb_addr);
     return slot_id;
 }
 
