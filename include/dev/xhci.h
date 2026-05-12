@@ -496,6 +496,47 @@ struct usb_device_descriptor {
     uint8_t  bNumConfigurations;
 } __attribute__((packed));
 
+struct usb_config_descriptor {
+    uint8_t  bLength;
+    uint8_t  bDescriptorType;
+    uint16_t wTotalLength;        // total bytes of this config bundle (header + interfaces + endpoints + class)
+    uint8_t  bNumInterfaces;
+    uint8_t  bConfigurationValue; // passed to SET_CONFIGURATION
+    uint8_t  iConfiguration;
+    uint8_t  bmAttributes;
+    uint8_t  bMaxPower;           // bus current draw in 2 mA units
+} __attribute__((packed));
+
+struct usb_interface_descriptor {
+    uint8_t  bLength;
+    uint8_t  bDescriptorType;
+    uint8_t  bInterfaceNumber;
+    uint8_t  bAlternateSetting;
+    uint8_t  bNumEndpoints;       // excludes EP0
+    uint8_t  bInterfaceClass;
+    uint8_t  bInterfaceSubClass;
+    uint8_t  bInterfaceProtocol;
+    uint8_t  iInterface;
+} __attribute__((packed));
+
+struct usb_endpoint_descriptor {
+    uint8_t  bLength;
+    uint8_t  bDescriptorType;
+    uint8_t  bEndpointAddress;    // bit 7 = direction (1=IN), bits 3:0 = ep number
+    uint8_t  bmAttributes;        // bits 1:0 = transfer type
+    uint16_t wMaxPacketSize;
+    uint8_t  bInterval;
+} __attribute__((packed));
+
+// USB endpoint address / attribute decoders
+#define USB_EP_NUM(addr)       ((addr) & 0xf)
+#define USB_EP_DIR_IN(addr)    (((addr) & 0x80) != 0)
+#define USB_EP_XFER_MASK       0x3
+#define USB_EP_XFER_CONTROL    0
+#define USB_EP_XFER_ISOCH      1
+#define USB_EP_XFER_BULK       2
+#define USB_EP_XFER_INTR       3
+
 //
 // Per-controller state.
 //
