@@ -122,15 +122,49 @@ struct usb_device {
     uint8_t  max_packet0;    // bMaxPacketSize0 (literal byte count, post-decode)
     uint8_t  num_configs;    // bNumConfigurations
 
+    // From first interface descriptor of config 0 (Phase 5.8 parse).
+    // Class drivers normally match against these because bDeviceClass
+    // is usually 0 ("see interfaces").
+    uint8_t  iface_class;
+    uint8_t  iface_subclass;
+    uint8_t  iface_protocol;
+    uint8_t  iface_num_eps;
+
     // Backing host controller (today always xHCI)
     struct xhci_hc *hc;
 
     // Linkage on the global device list
     struct list_head node;
 
-    // TODO cached config descriptor blob, parsed endpoint
-    // table, class-driver binding pointer.
+    // Bound class driver (NULL = unbound) and its per-device state.
+    // The probe sets driver_data; the framework only writes `driver`.
+    const struct usb_driver *driver;
+    void                    *driver_data;
 };
+
+//
+// Phase 6.3: class-driver probe table
+//
+// A driver advertises an interest in devices matching a (class, subclass,
+// protocol) triple. Use 0xff for "wildcard" on any field. After every
+// usb_register_device, the core walks the driver table and invokes the
+// first driver whose probe returns 0. A nonzero return means "not me";
+// the walk continues to the next match.
+//
+
+#define USB_ANY_CLASS    0xffu
+#define USB_ANY_SUBCLASS 0xffu
+#define USB_ANY_PROTOCOL 0xffu
+
+struct usb_driver {
+    uint8_t      match_class;
+    uint8_t      match_subclass;
+    uint8_t      match_protocol;
+    const char  *name;
+    int        (*probe)(struct usb_device *dev);
+};
+
+int usb_driver_register(const struct usb_driver *drv);
 
 //
 // Public API

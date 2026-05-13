@@ -963,9 +963,17 @@ static int xhci_get_descriptor(struct xhci_hc *hc, int slot_id, uint8_t dt_type,
 
 // Walk a configuration descriptor blob and log each interface and endpoint.
 // Class-specific descriptors interleave; we skip them.
-static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len) {
+// Walk a configuration descriptor blob. Logs each interface/endpoint
+// sub-descriptor and writes the FIRST interface's class triple back
+// through the out params (if non-NULL) for Phase 6.3 driver matching.
+static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len,
+                                         uint8_t *out_iface_class,
+                                         uint8_t *out_iface_subclass,
+                                         uint8_t *out_iface_protocol,
+                                         uint8_t *out_iface_num_eps) {
     static const char *xfer_names[] = { "control", "isoch", "bulk", "intr" };
     uint16_t off = 0;
+    int first_iface = 1;
     while (off + 2 <= len) {
         uint8_t bLength         = buf[off];
         uint8_t bDescriptorType = buf[off + 1];
@@ -985,6 +993,13 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                  iface->bInterfaceNumber, iface->bAlternateSetting,
                  iface->bInterfaceClass, iface->bInterfaceSubClass,
                  iface->bInterfaceProtocol, iface->bNumEndpoints);
+            if (first_iface) {
+                if (out_iface_class)    *out_iface_class    = iface->bInterfaceClass;
+                if (out_iface_subclass) *out_iface_subclass = iface->bInterfaceSubClass;
+                if (out_iface_protocol) *out_iface_protocol = iface->bInterfaceProtocol;
+                if (out_iface_num_eps)  *out_iface_num_eps  = iface->bNumEndpoints;
+                first_iface = 0;
+            }
             break;
         }
         case USB_DT_ENDPOINT: {
@@ -1121,7 +1136,11 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
         kmem_free(dev_desc);
         return -1;
     }
-    xhci_parse_config_descriptor(slot_id, cfg, total);
+    // Phase 6.3: capture the first interface's class triple so
+    // usb_register_device can match drivers against it.
+    uint8_t iface_class = 0, iface_sub = 0, iface_proto = 0, iface_n_eps = 0;
+    xhci_parse_config_descriptor(slot_id, cfg, total,
+                                 &iface_class, &iface_sub, &iface_proto, &iface_n_eps);
     kmem_free(cfg);
 
     // build the usb_device handle and register it with the USB core
@@ -1130,26 +1149,30 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
         kmem_free(dev_desc);
         return -1;
     }
-    udev->slot_id      = (uint8_t)slot_id;
-    udev->address      = usb_addr;
-    udev->speed        = (uint8_t)speed;
-    udev->port         = (uint8_t)port;
-    udev->vendor_id    = dev_desc->idVendor;
-    udev->product_id   = dev_desc->idProduct;
-    udev->bcd_usb      = dev_desc->bcdUSB;
-    udev->bcd_device   = dev_desc->bcdDevice;
-    udev->dev_class    = dev_desc->bDeviceClass;
-    udev->dev_subclass = dev_desc->bDeviceSubClass;
-    udev->dev_protocol = dev_desc->bDeviceProtocol;
-    udev->max_packet0  = dev_desc->bMaxPacketSize0;
-    udev->num_configs  = dev_desc->bNumConfigurations;
-    udev->hc           = hc;
+    udev->slot_id        = (uint8_t)slot_id;
+    udev->address        = usb_addr;
+    udev->speed          = (uint8_t)speed;
+    udev->port           = (uint8_t)port;
+    udev->vendor_id      = dev_desc->idVendor;
+    udev->product_id     = dev_desc->idProduct;
+    udev->bcd_usb        = dev_desc->bcdUSB;
+    udev->bcd_device     = dev_desc->bcdDevice;
+    udev->dev_class      = dev_desc->bDeviceClass;
+    udev->dev_subclass   = dev_desc->bDeviceSubClass;
+    udev->dev_protocol   = dev_desc->bDeviceProtocol;
+    udev->max_packet0    = dev_desc->bMaxPacketSize0;
+    udev->iface_class    = iface_class;
+    udev->iface_subclass = iface_sub;
+    udev->iface_protocol = iface_proto;
+    udev->iface_num_eps  = iface_n_eps;
+    udev->num_configs    = dev_desc->bNumConfigurations;
+    udev->hc             = hc;
     hc->usb_devices[slot_id] = udev;
     usb_register_device(udev);
 
     kmem_free(dev_desc);
 
-    INFO("port %u enumerated as slot %d; awaiting Phase 6.2 CONFIGURE_ENDPOINT\n",
+    INFO("port %u enumerated as slot %d; awaiting Phase 6.4 CONFIGURE_ENDPOINT\n",
          port, slot_id);
     return slot_id;
 }

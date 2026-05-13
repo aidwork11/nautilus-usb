@@ -16,6 +16,12 @@
 static struct list_head usb_devices;
 static int usb_devices_inited = 0;
 
+// Class driver table. Capped at a small fixed size for now -- drivers
+// register at boot, so this is read-mostly after init.
+#define USB_MAX_DRIVERS 16
+static const struct usb_driver *usb_drivers[USB_MAX_DRIVERS];
+static uint32_t usb_drivers_n = 0;
+
 static void usb_ensure_inited(void) {
     if (!usb_devices_inited) {
         INIT_LIST_HEAD(&usb_devices);
@@ -45,16 +51,78 @@ void usb_free_device(struct usb_device *dev) {
 }
 
 
+// Does drv match dev's interface (or fallback to device-level) triple?
+// 0xff in any match field is a wildcard. Interface-level fields are
+// checked first because bDeviceClass=0 is the common "see-interfaces"
+// pattern; device-level is the fallback for hubs / composite devices.
+static int usb_driver_matches(const struct usb_driver *drv,
+                              const struct usb_device *dev) {
+    uint8_t cls = dev->iface_class;
+    uint8_t sub = dev->iface_subclass;
+    uint8_t pro = dev->iface_protocol;
+    if (drv->match_class    != USB_ANY_CLASS    && drv->match_class    != cls) goto try_dev;
+    if (drv->match_subclass != USB_ANY_SUBCLASS && drv->match_subclass != sub) goto try_dev;
+    if (drv->match_protocol != USB_ANY_PROTOCOL && drv->match_protocol != pro) goto try_dev;
+    return 1;
+try_dev:
+    if (dev->dev_class == 0) return 0;   // no device-level fallback to try
+    cls = dev->dev_class;
+    sub = dev->dev_subclass;
+    pro = dev->dev_protocol;
+    if (drv->match_class    != USB_ANY_CLASS    && drv->match_class    != cls) return 0;
+    if (drv->match_subclass != USB_ANY_SUBCLASS && drv->match_subclass != sub) return 0;
+    if (drv->match_protocol != USB_ANY_PROTOCOL && drv->match_protocol != pro) return 0;
+    return 1;
+}
+
+// Walk the driver table and probe the first match. Stops at the first
+// driver whose probe returns 0 (successfully bound).
+static void usb_probe_drivers(struct usb_device *dev) {
+    for (uint32_t i = 0; i < usb_drivers_n; i++) {
+        const struct usb_driver *drv = usb_drivers[i];
+        if (!usb_driver_matches(drv, dev)) continue;
+        DEBUG("probing driver '%s' for slot %u\n", drv->name, dev->slot_id);
+        int rc = drv->probe(dev);
+        if (rc == 0) {
+            dev->driver = drv;
+            INFO("bound driver '%s' to slot %u (addr %u)\n",
+                 drv->name, dev->slot_id, dev->address);
+            return;
+        }
+        DEBUG("driver '%s' declined slot %u (rc=%d)\n", drv->name, dev->slot_id, rc);
+    }
+    DEBUG("no driver bound to slot %u\n", dev->slot_id);
+}
+
+
+int usb_driver_register(const struct usb_driver *drv) {
+    if (!drv || !drv->probe || !drv->name) {
+        ERROR("invalid driver registration\n");
+        return -1;
+    }
+    if (usb_drivers_n >= USB_MAX_DRIVERS) {
+        ERROR("driver table full; cannot register '%s'\n", drv->name);
+        return -1;
+    }
+    usb_drivers[usb_drivers_n++] = drv;
+    INFO("registered driver '%s' (class=%u sub=%u proto=%u)\n",
+         drv->name, drv->match_class, drv->match_subclass, drv->match_protocol);
+    return 0;
+}
+
+
 int usb_register_device(struct usb_device *dev) {
     if (!dev) return -1;
     usb_ensure_inited();
     list_add_tail(&dev->node, &usb_devices);
     INFO("registered slot %u addr %u: vendor=0x%04x product=0x%04x "
-         "class=%u sub=%u proto=%u speed=%u port=%u\n",
+         "iface_class=%u/%u/%u dev_class=%u speed=%u port=%u\n",
          dev->slot_id, dev->address,
          dev->vendor_id, dev->product_id,
-         dev->dev_class, dev->dev_subclass, dev->dev_protocol,
+         dev->iface_class, dev->iface_subclass, dev->iface_protocol,
+         dev->dev_class,
          dev->speed, dev->port);
+    usb_probe_drivers(dev);
     return 0;
 }
 

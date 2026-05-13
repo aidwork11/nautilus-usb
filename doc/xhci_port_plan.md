@@ -399,9 +399,68 @@ int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
                       void *data, size_t length, int dir);
 ```
 
+Control transfer is fully implemented (delegates to `xhci_control_transfer`
+on EP0). Bulk transfer is stubbed and returns -1 until 6.4 lands —
+implementing it requires CONFIGURE_ENDPOINT and per-endpoint transfer rings.
+
+A composite `usb_get_descriptor(dev, type, index, buf, len)` is layered on
+top of `usb_control_transfer` so class drivers can read descriptors without
+re-building the SETUP packet.
+
 ### 6.3 Device Class Hooks
 
-A simple table of `(class, subclass, protocol) -> probe()` callbacks, called after enumeration.
+A simple table of `(class, subclass, protocol) -> probe()` callbacks. After
+each `usb_register_device`, the USB core walks the table, finds the first
+matching entry (matching at the *interface* level — `bDeviceClass=0` is the
+common "see-interfaces" sentinel), and invokes the probe. The probe can
+read additional descriptors via `usb_get_descriptor`, bind a per-device
+state pointer to the `usb_device`, and either return success (driver bound)
+or failure (try next match).
+
+```c
+struct usb_driver {
+    uint8_t  match_class;       // 0xff = wildcard
+    uint8_t  match_subclass;    // 0xff = wildcard
+    uint8_t  match_protocol;    // 0xff = wildcard
+    const char *name;
+    int (*probe)(struct usb_device *dev);
+};
+
+int usb_driver_register(const struct usb_driver *drv);
+```
+
+Class drivers are static (compiled in for now); a registration call at boot
+adds them to the table. `usb_register_device` becomes the binding trigger.
+
+### 6.4 Bulk and Interrupt Endpoints
+
+Lifting the 6.2 stub. Requires:
+
+1. **`xhci_alloc_ep_ring`** — allocate a transfer ring for one non-EP0
+   endpoint and install it in the slot's input context.
+2. **`xhci_configure_endpoint`** — issue the CONFIGURE_ENDPOINT command
+   so the controller copies the new EP contexts into the output device
+   context and transitions the slot to Configured.
+3. **`xhci_normal_transfer`** — enqueue one NORMAL TRB on a non-EP0
+   transfer ring, ring the doorbell with target=EP DCI.
+4. **Endpoint cache on `usb_device`** — parsed table mapping `(ep_num, dir)`
+   to DCI and transfer ring, populated by walking the configuration
+   descriptor during enumeration.
+5. **`usb_bulk_transfer`** and **`usb_interrupt_transfer`** — both call
+   `xhci_normal_transfer` underneath; controller's EP_TYPE setting picks
+   the wire-level behavior (best-effort bulk vs polled interrupt).
+
+Note: 6.4 must also issue a `SET_CONFIGURATION` control transfer on the
+device before CONFIGURE_ENDPOINT, so the device-side endpoint state moves
+to active.
+
+### 6.5 Isochronous Transfers (deferred)
+
+Structurally distinct from bulk/interrupt: uses `XHCI_TRB_ISOCH` (not
+NORMAL), carries a frame-id field for scheduled delivery, no retries, and
+needs bandwidth reservation at CONFIGURE_ENDPOINT time. Deferred until an
+isoch-class driver (USB audio, webcam) is in scope. Not currently in the
+testing plan.
 
 ---
 
