@@ -153,4 +153,31 @@ int  usb_for_each_device(int (*cb)(struct usb_device *, void *), void *arg);
 
 void usb_dump_devices(void);
 
+//
+// Phase 6.2: transfer interface. HCI-agnostic wrappers that class
+// drivers use without touching the controller-specific code below.
+// Today these dispatch into xHCI directly; when a second HCI driver
+// arrives we'll route through a per-device ops table.
+//
+
+// Issue a USB control transfer on EP0. Returns bytes transferred on
+// success (possibly < length on short packet), or -1 on timeout / error.
+// Buffer must be physically contiguous; the HCI may DMA into/out of it.
+int usb_control_transfer(struct usb_device *dev,
+                         uint8_t request_type, uint8_t request,
+                         uint16_t value, uint16_t index,
+                         void *data, uint16_t length);
+
+// Issue a USB bulk transfer on the given endpoint number. dir is
+// USB_DIR_IN or USB_DIR_OUT. Returns bytes transferred or -1.
+// NOTE: stub until per-endpoint transfer rings exist (CONFIGURE_ENDPOINT).
+int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
+                      void *data, size_t length, int dir);
+
+// Composite helper: GET_DESCRIPTOR(type, index) into buf. Built on top
+// of usb_control_transfer so any HCI gets it for free.
+int usb_get_descriptor(struct usb_device *dev,
+                       uint8_t dt_type, uint8_t dt_index,
+                       void *buf, uint16_t length);
+
 #endif // __USB_H__

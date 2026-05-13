@@ -859,7 +859,7 @@ static uint64_t xhci_xfer_enqueue(struct xhci_ring *r, uint64_t param, uint32_t 
 
 // Issue one USB control transfer on a slot's EP0 ring and wait for its TRANSFER_EVENT
 // Returns bytes actually transferred on success
-static int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, void *buf, uint16_t wLength) {
+int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, void *buf, uint16_t wLength) {
     struct xhci_ring *r = &hc->ep0_rings[slot_id];
     int dir_in   = (bmRequestType & USB_DIR_IN) != 0;
     int has_data = wLength > 0;

@@ -529,4 +529,11 @@ struct xhci_hc {
 int xhci_pci_init(struct naut_info *naut);
 int xhci_pci_deinit(void);
 
+// Phase 6.2: exposed for the USB-layer transfer API. usb_control_transfer
+// dispatches to this when dev->hc points at an xHCI controller.
+int xhci_control_transfer(struct xhci_hc *hc, int slot_id,
+                          uint8_t bmRequestType, uint8_t bRequest,
+                          uint16_t wValue, uint16_t wIndex,
+                          void *buf, uint16_t wLength);
+
 #endif // __XHCI_H__

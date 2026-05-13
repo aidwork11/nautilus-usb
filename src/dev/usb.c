@@ -3,6 +3,7 @@
 #include <nautilus/list.h>
 #include <nautilus/naut_string.h>
 #include <dev/usb.h>
+#include <dev/xhci.h>
 
 
 #define INFO(fmt, args...)   INFO_PRINT("usb: " fmt, ##args)
@@ -104,4 +105,48 @@ void usb_dump_devices(void) {
              dev->dev_class, dev->dev_subclass, dev->dev_protocol,
              dev->num_configs);
     }
+}
+
+
+//
+// Phase 6.2 transfer interface
+//
+
+int usb_control_transfer(struct usb_device *dev,
+                         uint8_t request_type, uint8_t request,
+                         uint16_t value, uint16_t index,
+                         void *data, uint16_t length) {
+    if (!dev || !dev->hc) {
+        ERROR("control xfer: NULL device or hc\n");
+        return -1;
+    }
+    // Today we know hc is an xHCI controller. When a second HCI lands,
+    // this becomes dev->hc_ops->control_transfer(dev, ...).
+    return xhci_control_transfer(dev->hc, dev->slot_id,
+                                 request_type, request,
+                                 value, index, data, length);
+}
+
+int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
+                      void *data, size_t length, int dir) {
+    (void)data;
+    // TODO: requires CONFIGURE_ENDPOINT + per-EP transfer ring. Class
+    // drivers calling this should get a clean failure for now rather
+    // than a silent miss.
+    ERROR("bulk xfer not yet implemented (slot=%u ep=0x%02x len=%lu dir=%d)\n",
+          dev ? dev->slot_id : 0, ep, (unsigned long)length, dir);
+    return -1;
+}
+
+int usb_get_descriptor(struct usb_device *dev,
+                       uint8_t dt_type, uint8_t dt_index,
+                       void *buf, uint16_t length) {
+    // Standard "device-to-host, standard, device" descriptor read.
+    // wValue's high byte is the descriptor type, low byte is the index.
+    return usb_control_transfer(dev,
+                                USB_DIR_IN,
+                                USB_REQ_GET_DESCRIPTOR,
+                                (uint16_t)(dt_type << 8) | dt_index,
+                                0,
+                                buf, length);
 }
