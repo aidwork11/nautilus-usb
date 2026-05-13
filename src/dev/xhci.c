@@ -1061,15 +1061,13 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     INFO("slot %d: addressed (USB addr=%u, speed=%u)\n", slot_id, usb_addr, speed);
 
     // Full device descriptor read. Keep this buffer alive through to
-    // the Phase 6.1 usb_device population at the end of the function.
-    struct usb_device_descriptor *dev_desc =
-        kmem_mallocz(sizeof(struct usb_device_descriptor));
+    // the usb_device population at the end of the function
+    struct usb_device_descriptor *dev_desc = kmem_mallocz(sizeof(struct usb_device_descriptor));
     if (!dev_desc) {
         ERROR("slot %d: cannot allocate device descriptor buf\n", slot_id);
         return -1;
     }
-    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc,
-                                         sizeof(struct usb_device_descriptor));
+    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc, sizeof(struct usb_device_descriptor));
     if (got < (int)sizeof(struct usb_device_descriptor)) {
         ERROR("slot %d: full device descriptor read returned %d\n", slot_id, got);
         kmem_free(dev_desc);
@@ -1083,15 +1081,13 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
          dev_desc->bDeviceProtocol, dev_desc->bNumConfigurations);
 
     // Two-pass config descriptor read: header first (gives wTotalLength), then the full bundle
-    struct usb_config_descriptor *cfg_hdr =
-        kmem_mallocz(sizeof(struct usb_config_descriptor));
+    struct usb_config_descriptor *cfg_hdr = kmem_mallocz(sizeof(struct usb_config_descriptor));
     if (!cfg_hdr) {
         ERROR("slot %d: cannot allocate config header buf\n", slot_id);
         kmem_free(dev_desc);
         return -1;
     }
-    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0,
-                              cfg_hdr, sizeof(struct usb_config_descriptor));
+    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0, cfg_hdr, sizeof(struct usb_config_descriptor));
     if (got < (int)sizeof(struct usb_config_descriptor)) {
         ERROR("slot %d: config header read returned %d\n", slot_id, got);
         kmem_free(cfg_hdr);
@@ -1128,9 +1124,7 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     xhci_parse_config_descriptor(slot_id, cfg, total);
     kmem_free(cfg);
 
-    // Phase 6.1: build the HCI-agnostic usb_device handle and register
-    // it with the USB core. The handle becomes the per-device identity
-    // future class drivers and the shell debug commands will work with.
+    // build the usb_device handle and register it with the USB core
     struct usb_device *udev = usb_alloc_device();
     if (!udev) {
         kmem_free(dev_desc);
