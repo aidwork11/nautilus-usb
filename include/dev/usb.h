@@ -39,8 +39,7 @@ struct xhci_hc;
 #define USB_EP_XFER_BULK       2
 #define USB_EP_XFER_INTR       3
 
-// USB device speeds. Numerically aligned with xHCI's PORTSC SPEED field
-// (which uses the same encoding) so no translation is needed today.
+// USB device speeds
 #define USB_SPEED_UNKNOWN      0
 #define USB_SPEED_FS           1
 #define USB_SPEED_LS           2
@@ -111,7 +110,7 @@ struct usb_device {
     uint8_t  speed;          // USB_SPEED_*
     uint8_t  port;           // root hub port number (1-based)
 
-    // From device descriptor (Phase 5.6/5.8)
+    // From device descriptor
     uint16_t vendor_id;
     uint16_t product_id;
     uint16_t bcd_usb;
@@ -122,9 +121,7 @@ struct usb_device {
     uint8_t  max_packet0;    // bMaxPacketSize0 (literal byte count, post-decode)
     uint8_t  num_configs;    // bNumConfigurations
 
-    // From first interface descriptor of config 0 (Phase 5.8 parse).
-    // Class drivers normally match against these because bDeviceClass
-    // is usually 0 ("see interfaces").
+    // From first interface descriptor of config 0
     uint8_t  iface_class;
     uint8_t  iface_subclass;
     uint8_t  iface_protocol;
@@ -143,13 +140,7 @@ struct usb_device {
 };
 
 //
-// Phase 6.3: class-driver probe table
-//
-// A driver advertises an interest in devices matching a (class, subclass,
-// protocol) triple. Use 0xff for "wildcard" on any field. After every
-// usb_register_device, the core walks the driver table and invokes the
-// first driver whose probe returns 0. A nonzero return means "not me";
-// the walk continues to the next match.
+// class-driver probe table
 //
 
 #define USB_ANY_CLASS    0xffu
