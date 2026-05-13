@@ -940,12 +940,7 @@ static int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequ
 }
 
 static int xhci_get_device_descriptor(struct xhci_hc *hc, int slot_id, void *buf, uint16_t len) {
-    int desc = xhci_control_transfer(hc, slot_id,
-                                    USB_DIR_IN,
-                                    USB_REQ_GET_DESCRIPTOR,
-                                    (uint16_t)(USB_DT_DEVICE << 8) | 0,
-                                    0,
-                                    buf, len);
+    int desc = xhci_control_transfer(hc, slot_id, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR, (uint16_t)(USB_DT_DEVICE << 8) | 0, 0, buf, len);
     if (desc < 0) return -1;
     if (desc < (int)len) {
         DEBUG("slot %d: GET_DESCRIPTOR returned short (%d/%u)\n",
@@ -954,18 +949,10 @@ static int xhci_get_device_descriptor(struct xhci_hc *hc, int slot_id, void *buf
     return desc;
 }
 
-// Generic GET_DESCRIPTOR for non-device descriptor types (configuration,
-// string, etc). wValue's high byte is the descriptor type, low byte is
-// the descriptor index.
-static int xhci_get_descriptor(struct xhci_hc *hc, int slot_id,
-                               uint8_t dt_type, uint8_t dt_index,
-                               void *buf, uint16_t len) {
-    int desc = xhci_control_transfer(hc, slot_id,
-                                     USB_DIR_IN,
-                                     USB_REQ_GET_DESCRIPTOR,
-                                     (uint16_t)(dt_type << 8) | dt_index,
-                                     0,
-                                     buf, len);
+// Generic GET_DESCRIPTOR for non-device descriptor types 
+// wValue's high byte is the descriptor type, low byte is the descriptor index.
+static int xhci_get_descriptor(struct xhci_hc *hc, int slot_id, uint8_t dt_type, uint8_t dt_index, void *buf, uint16_t len) {
+    int desc = xhci_control_transfer(hc, slot_id, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR, (uint16_t)(dt_type << 8) | dt_index, 0, buf, len);
     if (desc < 0) return -1;
     if (desc < (int)len) {
         DEBUG("slot %d: GET_DESCRIPTOR(type=%u idx=%u) short (%d/%u)\n",
@@ -975,8 +962,7 @@ static int xhci_get_descriptor(struct xhci_hc *hc, int slot_id,
 }
 
 // Walk a configuration descriptor blob and log each interface and endpoint.
-// The blob is concatenated descriptors: [config 9B][iface 9B][ep 7B]...[iface]...
-// Class-specific descriptors (HID, CDC, ...) interleave; we skip them.
+// Class-specific descriptors interleave; we skip them.
 static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len) {
     static const char *xfer_names[] = { "control", "isoch", "bulk", "intr" };
     uint16_t off = 0;
@@ -993,8 +979,7 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
             // Skip - the caller already logged the header before this walk.
             break;
         case USB_DT_INTERFACE: {
-            struct usb_interface_descriptor *iface =
-                (struct usb_interface_descriptor *)(buf + off);
+            struct usb_interface_descriptor *iface = (struct usb_interface_descriptor *)(buf + off);
             INFO("slot %d: iface %u alt %u: class=%u sub=%u proto=%u eps=%u\n",
                  slot_id,
                  iface->bInterfaceNumber, iface->bAlternateSetting,
@@ -1003,15 +988,12 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
             break;
         }
         case USB_DT_ENDPOINT: {
-            struct usb_endpoint_descriptor *ep =
-                (struct usb_endpoint_descriptor *)(buf + off);
+            struct usb_endpoint_descriptor *ep = (struct usb_endpoint_descriptor *)(buf + off);
             uint8_t xfer = ep->bmAttributes & USB_EP_XFER_MASK;
             INFO("slot %d:   ep%u %s %s max_pkt=%u interval=%u\n",
                  slot_id,
                  USB_EP_NUM(ep->bEndpointAddress),
-                 USB_EP_DIR_IN(ep->bEndpointAddress) ? "IN " : "OUT",
-                 xfer_names[xfer],
-                 ep->wMaxPacketSize, ep->bInterval);
+                 USB_EP_DIR_IN(ep->bEndpointAddress) ? "IN " : "OUT", xfer_names[xfer], ep->wMaxPacketSize, ep->bInterval);
             break;
         }
         default:
@@ -1078,19 +1060,17 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint8_t usb_addr = hc->device_ctxs[slot_id]->slot.fields[3] & 0xff;
     INFO("slot %d: addressed (USB addr=%u, speed=%u)\n", slot_id, usb_addr, speed);
 
-    // Phase 5.8: now that the device is Addressed and EP0 max_pkt is
-    // correct, read the full 18-byte device descriptor for vendor/product
-    // info, then walk the configuration descriptor for interface and
+    // now that the device is Addressed and EP0 max_pkt is
+    // correct, read the full device descriptor for vendor/product
+    // then walk the configuration descriptor for interface and
     // endpoint topology.
 
-    struct usb_device_descriptor *dev_desc =
-        kmem_mallocz(sizeof(struct usb_device_descriptor));
+    struct usb_device_descriptor *dev_desc = kmem_mallocz(sizeof(struct usb_device_descriptor));
     if (!dev_desc) {
         ERROR("slot %d: cannot allocate device descriptor buf\n", slot_id);
         return -1;
     }
-    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc,
-                                         sizeof(struct usb_device_descriptor));
+    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc, sizeof(struct usb_device_descriptor));
     if (got < (int)sizeof(struct usb_device_descriptor)) {
         ERROR("slot %d: full device descriptor read returned %d\n", slot_id, got);
         kmem_free(dev_desc);
@@ -1106,17 +1086,13 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint16_t product = dev_desc->idProduct;
     kmem_free(dev_desc);
 
-    // Two-pass config descriptor read: header first (gives wTotalLength),
-    // then the full bundle. The device returns up to wLength bytes from
-    // the start, so a wLength=9 first call yields just the 9-byte header.
-    struct usb_config_descriptor *cfg_hdr =
-        kmem_mallocz(sizeof(struct usb_config_descriptor));
+    // Two-pass config descriptor read: header first (gives wTotalLength), then the full bundle
+    struct usb_config_descriptor *cfg_hdr = kmem_mallocz(sizeof(struct usb_config_descriptor));
     if (!cfg_hdr) {
         ERROR("slot %d: cannot allocate config header buf\n", slot_id);
         return -1;
     }
-    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0,
-                              cfg_hdr, sizeof(struct usb_config_descriptor));
+    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0, cfg_hdr, sizeof(struct usb_config_descriptor));
     if (got < (int)sizeof(struct usb_config_descriptor)) {
         ERROR("slot %d: config header read returned %d\n", slot_id, got);
         kmem_free(cfg_hdr);
