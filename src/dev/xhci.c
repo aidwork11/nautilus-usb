@@ -1060,17 +1060,16 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     uint8_t usb_addr = hc->device_ctxs[slot_id]->slot.fields[3] & 0xff;
     INFO("slot %d: addressed (USB addr=%u, speed=%u)\n", slot_id, usb_addr, speed);
 
-    // now that the device is Addressed and EP0 max_pkt is
-    // correct, read the full device descriptor for vendor/product
-    // then walk the configuration descriptor for interface and
-    // endpoint topology.
-
-    struct usb_device_descriptor *dev_desc = kmem_mallocz(sizeof(struct usb_device_descriptor));
+    // Full device descriptor read. Keep this buffer alive through to
+    // the Phase 6.1 usb_device population at the end of the function.
+    struct usb_device_descriptor *dev_desc =
+        kmem_mallocz(sizeof(struct usb_device_descriptor));
     if (!dev_desc) {
         ERROR("slot %d: cannot allocate device descriptor buf\n", slot_id);
         return -1;
     }
-    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc, sizeof(struct usb_device_descriptor));
+    int got = xhci_get_device_descriptor(hc, slot_id, dev_desc,
+                                         sizeof(struct usb_device_descriptor));
     if (got < (int)sizeof(struct usb_device_descriptor)) {
         ERROR("slot %d: full device descriptor read returned %d\n", slot_id, got);
         kmem_free(dev_desc);
@@ -1082,20 +1081,21 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
          dev_desc->idVendor, dev_desc->idProduct, dev_desc->bcdDevice,
          dev_desc->bDeviceClass, dev_desc->bDeviceSubClass,
          dev_desc->bDeviceProtocol, dev_desc->bNumConfigurations);
-    uint16_t vendor  = dev_desc->idVendor;
-    uint16_t product = dev_desc->idProduct;
-    kmem_free(dev_desc);
 
     // Two-pass config descriptor read: header first (gives wTotalLength), then the full bundle
-    struct usb_config_descriptor *cfg_hdr = kmem_mallocz(sizeof(struct usb_config_descriptor));
+    struct usb_config_descriptor *cfg_hdr =
+        kmem_mallocz(sizeof(struct usb_config_descriptor));
     if (!cfg_hdr) {
         ERROR("slot %d: cannot allocate config header buf\n", slot_id);
+        kmem_free(dev_desc);
         return -1;
     }
-    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0, cfg_hdr, sizeof(struct usb_config_descriptor));
+    got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0,
+                              cfg_hdr, sizeof(struct usb_config_descriptor));
     if (got < (int)sizeof(struct usb_config_descriptor)) {
         ERROR("slot %d: config header read returned %d\n", slot_id, got);
         kmem_free(cfg_hdr);
+        kmem_free(dev_desc);
         return -1;
     }
     uint16_t total = cfg_hdr->wTotalLength;
@@ -1107,12 +1107,14 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
 
     if (total < sizeof(struct usb_config_descriptor) || total > 4096) {
         ERROR("slot %d: implausible config total length %u\n", slot_id, total);
+        kmem_free(dev_desc);
         return -1;
     }
 
     uint8_t *cfg = kmem_mallocz(total);
     if (!cfg) {
         ERROR("slot %d: cannot allocate %u-byte config buf\n", slot_id, total);
+        kmem_free(dev_desc);
         return -1;
     }
     got = xhci_get_descriptor(hc, slot_id, USB_DT_CONFIGURATION, 0, cfg, total);
@@ -1120,13 +1122,41 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
         ERROR("slot %d: full config read returned %d (expected %u)\n",
               slot_id, got, total);
         kmem_free(cfg);
+        kmem_free(dev_desc);
         return -1;
     }
     xhci_parse_config_descriptor(slot_id, cfg, total);
     kmem_free(cfg);
 
-    INFO("port %u enumerated as slot %d (vendor=0x%04x product=0x%04x); awaiting Phase 6 CONFIGURE_ENDPOINT\n",
-         port, slot_id, vendor, product);
+    // Phase 6.1: build the HCI-agnostic usb_device handle and register
+    // it with the USB core. The handle becomes the per-device identity
+    // future class drivers and the shell debug commands will work with.
+    struct usb_device *udev = usb_alloc_device();
+    if (!udev) {
+        kmem_free(dev_desc);
+        return -1;
+    }
+    udev->slot_id      = (uint8_t)slot_id;
+    udev->address      = usb_addr;
+    udev->speed        = (uint8_t)speed;
+    udev->port         = (uint8_t)port;
+    udev->vendor_id    = dev_desc->idVendor;
+    udev->product_id   = dev_desc->idProduct;
+    udev->bcd_usb      = dev_desc->bcdUSB;
+    udev->bcd_device   = dev_desc->bcdDevice;
+    udev->dev_class    = dev_desc->bDeviceClass;
+    udev->dev_subclass = dev_desc->bDeviceSubClass;
+    udev->dev_protocol = dev_desc->bDeviceProtocol;
+    udev->max_packet0  = dev_desc->bMaxPacketSize0;
+    udev->num_configs  = dev_desc->bNumConfigurations;
+    udev->hc           = hc;
+    hc->usb_devices[slot_id] = udev;
+    usb_register_device(udev);
+
+    kmem_free(dev_desc);
+
+    INFO("port %u enumerated as slot %d; awaiting Phase 6.2 CONFIGURE_ENDPOINT\n",
+         port, slot_id);
     return slot_id;
 }
 
@@ -1437,6 +1467,17 @@ static void xhci_teardown(struct xhci_hc *hc) {
         kmem_free(hc->ep0_rings);
         hc->ep0_rings = NULL;
     }
+    if (hc->usb_devices) {
+        for (uint32_t i = 1; i <= hc->max_slots; i++) {
+            if (hc->usb_devices[i]) {
+                usb_unregister_device(hc->usb_devices[i]);
+                usb_free_device(hc->usb_devices[i]);
+                hc->usb_devices[i] = NULL;
+            }
+        }
+        kmem_free(hc->usb_devices);
+        hc->usb_devices = NULL;
+    }
 }
 
 
@@ -1473,10 +1514,11 @@ static int xhci_init(struct xhci_hc *hc) {
         return -1;
     }
     size_t n = (size_t)hc->max_slots + 1;
-    hc->device_ctxs = kmem_mallocz(n * sizeof(struct xhci_device_ctx *));
-    hc->input_ctxs  = kmem_mallocz(n * sizeof(struct xhci_input_ctx *));
-    hc->ep0_rings   = kmem_mallocz(n * sizeof(struct xhci_ring));
-    if (!hc->device_ctxs || !hc->input_ctxs || !hc->ep0_rings) {
+    hc->device_ctxs  = kmem_mallocz(n * sizeof(struct xhci_device_ctx *));
+    hc->input_ctxs   = kmem_mallocz(n * sizeof(struct xhci_input_ctx *));
+    hc->ep0_rings    = kmem_mallocz(n * sizeof(struct xhci_ring));
+    hc->usb_devices  = kmem_mallocz(n * sizeof(struct usb_device *));
+    if (!hc->device_ctxs || !hc->input_ctxs || !hc->ep0_rings || !hc->usb_devices) {
         ERROR("cannot allocate slot tracking arrays\n");
         goto fail;
     }

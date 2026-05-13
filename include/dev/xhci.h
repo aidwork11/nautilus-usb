@@ -4,6 +4,7 @@
 #include <nautilus/naut_types.h>
 #include <nautilus/list.h>
 #include <nautilus/spinlock.h>
+#include <dev/usb.h>
 
 struct pci_dev;
 struct naut_info;
@@ -454,88 +455,8 @@ struct xhci_xfer_wait {
     volatile uint32_t   residual_len;       // bytes NOT transferred
 };
 
-//
-// Minimal USB descriptor / request types
-// Will move into <dev/usb.h> when the USB core is set up
-//
-
-#define USB_DIR_IN              0x80
-#define USB_DIR_OUT             0x00
-
-// Standard request codes (bRequest)
-#define USB_REQ_GET_STATUS         0
-#define USB_REQ_CLEAR_FEATURE      1
-#define USB_REQ_SET_FEATURE        3
-#define USB_REQ_SET_ADDRESS        5
-#define USB_REQ_GET_DESCRIPTOR     6
-#define USB_REQ_SET_DESCRIPTOR     7
-#define USB_REQ_GET_CONFIGURATION  8
-#define USB_REQ_SET_CONFIGURATION  9
-
-// Descriptor types (high byte of wValue for GET_DESCRIPTOR)
-#define USB_DT_DEVICE              1
-#define USB_DT_CONFIGURATION       2
-#define USB_DT_STRING              3
-#define USB_DT_INTERFACE           4
-#define USB_DT_ENDPOINT            5
-
-struct usb_device_descriptor {
-    uint8_t  bLength;
-    uint8_t  bDescriptorType;
-    uint16_t bcdUSB;
-    uint8_t  bDeviceClass;
-    uint8_t  bDeviceSubClass;
-    uint8_t  bDeviceProtocol;
-    uint8_t  bMaxPacketSize0;
-    uint16_t idVendor;
-    uint16_t idProduct;
-    uint16_t bcdDevice;
-    uint8_t  iManufacturer;
-    uint8_t  iProduct;
-    uint8_t  iSerialNumber;
-    uint8_t  bNumConfigurations;
-} __attribute__((packed));
-
-struct usb_config_descriptor {
-    uint8_t  bLength;
-    uint8_t  bDescriptorType;
-    uint16_t wTotalLength;        // total bytes of this config bundle (header + interfaces + endpoints + class)
-    uint8_t  bNumInterfaces;
-    uint8_t  bConfigurationValue; // passed to SET_CONFIGURATION
-    uint8_t  iConfiguration;
-    uint8_t  bmAttributes;
-    uint8_t  bMaxPower;           // bus current draw in 2 mA units
-} __attribute__((packed));
-
-struct usb_interface_descriptor {
-    uint8_t  bLength;
-    uint8_t  bDescriptorType;
-    uint8_t  bInterfaceNumber;
-    uint8_t  bAlternateSetting;
-    uint8_t  bNumEndpoints;       // excludes EP0
-    uint8_t  bInterfaceClass;
-    uint8_t  bInterfaceSubClass;
-    uint8_t  bInterfaceProtocol;
-    uint8_t  iInterface;
-} __attribute__((packed));
-
-struct usb_endpoint_descriptor {
-    uint8_t  bLength;
-    uint8_t  bDescriptorType;
-    uint8_t  bEndpointAddress;    // bit 7 = direction (1=IN), bits 3:0 = ep number
-    uint8_t  bmAttributes;        // bits 1:0 = transfer type
-    uint16_t wMaxPacketSize;
-    uint8_t  bInterval;
-} __attribute__((packed));
-
-// USB endpoint address / attribute decoders
-#define USB_EP_NUM(addr)       ((addr) & 0xf)
-#define USB_EP_DIR_IN(addr)    (((addr) & 0x80) != 0)
-#define USB_EP_XFER_MASK       0x3
-#define USB_EP_XFER_CONTROL    0
-#define USB_EP_XFER_ISOCH      1
-#define USB_EP_XFER_BULK       2
-#define USB_EP_XFER_INTR       3
+// USB descriptors, request codes, and the usb_device handle live in
+// <dev/usb.h>, which xhci.h includes at the top.
 
 //
 // Per-controller state.
@@ -577,6 +498,7 @@ struct xhci_hc {
     struct xhci_device_ctx **device_ctxs;
     struct xhci_input_ctx  **input_ctxs;
     struct xhci_ring        *ep0_rings;     // EP0 transfer rings, one per slot
+    struct usb_device      **usb_devices;   // HCI-agnostic per-slot handle
 
     // In-flight command (TODO, single in-flight right now).
     // Set by the issuer before ringing the command doorbell, cleared after completion
