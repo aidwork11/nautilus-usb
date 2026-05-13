@@ -455,9 +455,6 @@ struct xhci_xfer_wait {
     volatile uint32_t   residual_len;       // bytes NOT transferred
 };
 
-// USB descriptors, request codes, and the usb_device handle live in
-// <dev/usb.h>, which xhci.h includes at the top.
-
 //
 // Per-controller state.
 //
