@@ -11,13 +11,11 @@
 #define ERROR(fmt, args...)  ERROR_PRINT("usb: " fmt, ##args)
 
 
-// Global list of registered USB devices. Lazy-initialized on first
-// register; xHCI is the only producer today.
+// Global list of registered USB devices. Lazy-initialized on first register
 static struct list_head usb_devices;
 static int usb_devices_inited = 0;
 
-// Class driver table. Capped at a small fixed size for now -- drivers
-// register at boot, so this is read-mostly after init.
+// Class driver table
 #define USB_MAX_DRIVERS 16
 static const struct usb_driver *usb_drivers[USB_MAX_DRIVERS];
 static uint32_t usb_drivers_n = 0;
@@ -52,9 +50,6 @@ void usb_free_device(struct usb_device *dev) {
 
 
 // Does drv match dev's interface (or fallback to device-level) triple?
-// 0xff in any match field is a wildcard. Interface-level fields are
-// checked first because bDeviceClass=0 is the common "see-interfaces"
-// pattern; device-level is the fallback for hubs / composite devices.
 static int usb_driver_matches(const struct usb_driver *drv,
                               const struct usb_device *dev) {
     uint8_t cls = dev->iface_class;
