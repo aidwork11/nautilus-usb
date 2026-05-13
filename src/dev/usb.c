@@ -184,12 +184,62 @@ int usb_control_transfer(struct usb_device *dev, uint8_t request_type, uint8_t r
     return xhci_control_transfer(dev->hc, dev->slot_id, request_type, request, value, index, data, length);
 }
 
-int usb_bulk_transfer(struct usb_device *dev, uint8_t ep, void *data, size_t length, int dir) {
-    (void)data;
-    // TODO: requires CONFIGURE_ENDPOINT + per-EP transfer ring
-    ERROR("bulk xfer not yet implemented (slot=%u ep=0x%02x len=%lu dir=%d)\n",
-          dev ? dev->slot_id : 0, ep, (unsigned long)length, dir);
-    return -1;
+struct usb_endpoint *usb_find_endpoint(struct usb_device *dev,
+                                       uint8_t ep_num, int dir_in) {
+    if (!dev) return NULL;
+    for (uint32_t i = 0; i < dev->num_endpoints; i++) {
+        struct usb_endpoint *e = &dev->endpoints[i];
+        if (!e->active) continue;
+        if (USB_EP_NUM(e->address) == ep_num &&
+            USB_EP_DIR_IN(e->address) == (dir_in != 0)) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+// Bulk and interrupt both queue NORMAL TRBs on a non-EP0 transfer ring;
+// the EP_TYPE in the controller's EP context (set up by CONFIGURE_ENDPOINT)
+// is what makes the wire behavior differ. Same dispatch logic for both.
+static int usb_normal_transfer(struct usb_device *dev, uint8_t ep,
+                               void *data, size_t length, int dir,
+                               uint8_t expected_xfer_type, const char *what) {
+    if (!dev || !dev->hc) {
+        ERROR("%s xfer: NULL device or hc\n", what);
+        return -1;
+    }
+    if (length > 0xffff) {
+        ERROR("%s xfer slot=%u ep=%u: len %lu exceeds single-TRB max\n",
+              what, dev->slot_id, ep, (unsigned long)length);
+        return -1;
+    }
+    int dir_in = (dir & USB_DIR_IN) != 0;
+    struct usb_endpoint *e = usb_find_endpoint(dev, ep, dir_in);
+    if (!e) {
+        ERROR("%s xfer slot=%u ep=%u dir=%s: endpoint not found\n",
+              what, dev->slot_id, ep, dir_in ? "IN" : "OUT");
+        return -1;
+    }
+    if ((e->attributes & USB_EP_XFER_MASK) != expected_xfer_type) {
+        ERROR("%s xfer slot=%u ep=%u: wrong endpoint type (got %u, want %u)\n",
+              what, dev->slot_id, ep, e->attributes & USB_EP_XFER_MASK,
+              expected_xfer_type);
+        return -1;
+    }
+    return xhci_normal_transfer(dev->hc, dev->slot_id, e->dci,
+                                data, (uint16_t)length);
+}
+
+int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
+                      void *data, size_t length, int dir) {
+    return usb_normal_transfer(dev, ep, data, length, dir,
+                               USB_EP_XFER_BULK, "bulk");
+}
+
+int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
+                           void *data, size_t length, int dir) {
+    return usb_normal_transfer(dev, ep, data, length, dir,
+                               USB_EP_XFER_INTR, "intr");
 }
 
 int usb_get_descriptor(struct usb_device *dev, uint8_t dt_type, uint8_t dt_index, void *buf, uint16_t length) {

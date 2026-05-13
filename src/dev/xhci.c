@@ -819,6 +819,237 @@ static int xhci_evaluate_ep0_max_pkt(struct xhci_hc *hc, int slot_id,
 
 
 //
+// Phase 6.4: non-EP0 endpoint setup and NORMAL transfers
+//
+// Forward-declare the two ring helpers from the control-transfer
+// section below since xhci_normal_transfer needs them.
+static void xhci_ring_reserve(struct xhci_ring *r, uint32_t n_trbs);
+static uint64_t xhci_xfer_enqueue(struct xhci_ring *r, uint64_t param,
+                                  uint32_t status, uint32_t control);
+
+
+// Allocate a transfer ring for one non-EP0 endpoint. Mirrors the EP0
+// ring allocation in xhci_alloc_input_ctx: RING_SIZE TRBs, LINK at the
+// end pointing back to base with TC=1, initial cycle = 1.
+static struct xhci_ring *xhci_alloc_ep_ring(int slot_id, int dci) {
+    struct xhci_ring *r = kmem_mallocz(sizeof(*r));
+    if (!r) {
+        ERROR("slot %d dci %d: cannot allocate ring struct\n", slot_id, dci);
+        return NULL;
+    }
+    size_t ring_bytes = XHCI_RING_SIZE * sizeof(struct xhci_trb);
+    r->trbs = kmem_mallocz(ring_bytes);
+    if (!r->trbs) {
+        ERROR("slot %d dci %d: cannot allocate ring TRBs\n", slot_id, dci);
+        kmem_free(r);
+        return NULL;
+    }
+    if ((uint64_t)r->trbs & (XHCI_RING_ALIGN - 1)) {
+        ERROR("slot %d dci %d: ring not %u-byte aligned\n",
+              slot_id, dci, XHCI_RING_ALIGN);
+        kmem_free(r->trbs);
+        kmem_free(r);
+        return NULL;
+    }
+    r->trbs_phys = (uint64_t)r->trbs;
+    r->enq       = 0;
+    r->deq       = 0;
+    r->cycle     = 1;
+
+    struct xhci_trb *link = &r->trbs[XHCI_RING_SIZE - 1];
+    link->param   = r->trbs_phys;
+    link->status  = 0;
+    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC;
+    return r;
+}
+
+// Map (transfer type, direction) to the xHCI EP_TYPE encoding.
+//   0 = invalid, 1 = isoch OUT, 2 = bulk OUT, 3 = intr OUT,
+//   4 = control,  5 = isoch IN,  6 = bulk IN,  7 = intr IN
+static uint8_t xhci_ep_type_for(uint8_t bm_attributes, int dir_in) {
+    static const uint8_t table[8] = {
+        4, 4,   // control (rare on non-EP0 but valid)
+        1, 5,   // isoch
+        2, 6,   // bulk
+        3, 7,   // intr
+    };
+    uint8_t xfer = bm_attributes & USB_EP_XFER_MASK;
+    return table[xfer * 2 + (dir_in ? 1 : 0)];
+}
+
+// Populate an EP context in an input context for CONFIGURE_ENDPOINT.
+// Spec section 6.2.3 fields:
+//   DW0 [23:16] = Interval (2^Interval * 125us between requests, for periodic EPs)
+//   DW1 [5:3]   = EP Type, [2:1] = CErr, [31:16] = Max Packet Size
+//   DW2/DW3     = TR Dequeue Pointer (64-bit) | DCS (initial cycle = 1)
+//   DW4 [15:0]  = Average TRB Length (used for bandwidth estimation; we set to max_pkt)
+static void xhci_init_ep_ctx(struct xhci_ep_ctx *ep,
+                             struct xhci_ring *ring,
+                             const struct usb_endpoint *desc,
+                             uint8_t speed) {
+    int dir_in = USB_EP_DIR_IN(desc->address);
+    uint8_t ep_type = xhci_ep_type_for(desc->attributes, dir_in);
+    uint16_t max_pkt = desc->max_packet & 0x7ff;
+
+    // Interval encoding for periodic endpoints. HS/SS use bInterval as
+    // an exponent (2^(bInterval-1) microframes); FS/LS use bInterval as
+    // a literal frame count and we'd need a log2 conversion. For now
+    // the HS/SS path is what QEMU exercises; FS uses a rough fallback.
+    uint8_t interval = 0;
+    uint8_t xfer = desc->attributes & USB_EP_XFER_MASK;
+    if (xfer == USB_EP_XFER_INTR || xfer == USB_EP_XFER_ISOCH) {
+        if (speed == USB_SPEED_HS || speed == USB_SPEED_SS || speed == USB_SPEED_SSP) {
+            interval = desc->interval > 0 ? desc->interval - 1 : 0;
+        } else {
+            interval = desc->interval;   // approximation; refine for FS/LS
+        }
+    }
+
+    memset(ep, 0, sizeof(*ep));
+    ep->fields[0] = ((uint32_t)interval << 16);
+    ep->fields[1] =
+        ((uint32_t)ep_type << XHCI_EP_DW1_EP_TYPE_SHIFT) |
+        (3u                << XHCI_EP_DW1_CERR_SHIFT) |
+        ((uint32_t)max_pkt << XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT);
+    uint64_t deq = ring->trbs_phys | XHCI_EP_DCS;
+    ep->fields[2] = (uint32_t)(deq & 0xffffffffu);
+    ep->fields[3] = (uint32_t)(deq >> 32);
+    ep->fields[4] = max_pkt;   // Average TRB Length = max packet size
+}
+
+// Issue CONFIGURE_ENDPOINT for all endpoints on the device's active
+// interface. Allocates a transfer ring per EP, fills the input context,
+// then runs the xHCI command. The slot transitions to Configured.
+static int xhci_configure_endpoint(struct xhci_hc *hc, int slot_id,
+                                   uint8_t speed,
+                                   struct usb_endpoint *endpoints,
+                                   uint32_t num_endpoints) {
+    struct xhci_input_ctx *in = hc->input_ctxs[slot_id];
+    if (!in) {
+        ERROR("slot %d: CONFIGURE_ENDPOINT without input context\n", slot_id);
+        return -1;
+    }
+
+    // Snapshot the current OUTPUT slot context into the INPUT slot ctx
+    // first. The controller wrote the assigned USB address (DW3) and
+    // slot state into the output during ADDRESS_DEVICE; CONFIGURE_ENDPOINT
+    // with A0=1 would copy our stale input slot ctx (address=0) back
+    // over those, so we must start from the live values.
+    in->device.slot = hc->device_ctxs[slot_id]->slot;
+
+    // add_flags: A0 (slot) + one bit per new EP. Deliberately NOT A1
+    // (EP0) -- the input EP0 ctx's TR Dequeue Pointer is stale (the
+    // controller has advanced past it during enumeration's descriptor
+    // reads), and including A1 would reset EP0 to that old pointer.
+    uint32_t add_flags = XHCI_INPUT_A0_SLOT;
+    uint8_t highest_dci = XHCI_EP0_ID;   // at least EP0 (DCI 1)
+
+    for (uint32_t i = 0; i < num_endpoints; i++) {
+        struct usb_endpoint *e = &endpoints[i];
+        if (!e->active) continue;
+        int dir_in = USB_EP_DIR_IN(e->address);
+        int ep_num = USB_EP_NUM(e->address);
+        if (ep_num < 1 || ep_num > 15) {
+            ERROR("slot %d: invalid ep_num %d\n", slot_id, ep_num);
+            return -1;
+        }
+        uint8_t dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
+        e->dci = dci;
+
+        struct xhci_ring *ring = xhci_alloc_ep_ring(slot_id, dci);
+        if (!ring) return -1;
+        hc->ep_rings[slot_id * 32 + dci] = ring;
+
+        // EP context array index = DCI - 1 (slot is at DCI 0 in its own field).
+        struct xhci_ep_ctx *ep_ctx = &in->device.ep[dci - 1];
+        xhci_init_ep_ctx(ep_ctx, ring, e, speed);
+
+        add_flags |= XHCI_INPUT_A_EP(dci);
+        if (dci > highest_dci) highest_dci = dci;
+    }
+
+    // Slot context's Context Entries field must equal the highest DCI of
+    // any EP being added. Update only that field; the rest is already
+    // correct from the output snapshot above.
+    in->device.slot.fields[0] =
+        (in->device.slot.fields[0] & ~XHCI_SLOT_DW0_CTX_ENTRIES_MASK) |
+        (((uint32_t)highest_dci << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT)
+            & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
+
+    in->ctrl.add_flags  = add_flags;
+    in->ctrl.drop_flags = 0;
+
+    uint64_t param   = (uint64_t)in;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT)
+                     | XHCI_TRB_SLOT_ID(slot_id);
+
+    if (xhci_run_command(hc, param, 0, control,
+                         NULL, "CONFIGURE_ENDPOINT") < 0) {
+        return -1;
+    }
+    INFO("slot %d: CONFIGURE_ENDPOINT complete (highest DCI=%u, add_flags=0x%x)\n",
+         slot_id, highest_dci, add_flags);
+    return 0;
+}
+
+// Issue one NORMAL TRB on a non-EP0 endpoint's transfer ring and wait
+// for its TRANSFER_EVENT. Used by usb_bulk_transfer and
+// usb_interrupt_transfer; the controller's EP_TYPE (configured by
+// CONFIGURE_ENDPOINT) decides the wire-level semantics.
+int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci,
+                         void *buf, uint16_t length) {
+    if (dci < 2 || dci > 31) {
+        ERROR("normal xfer: invalid DCI %d\n", dci);
+        return -1;
+    }
+    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
+    if (!r) {
+        ERROR("normal xfer slot=%d dci=%d: endpoint not configured\n",
+              slot_id, dci);
+        return -1;
+    }
+
+    xhci_ring_reserve(r, 1);
+
+    uint32_t status = length;   // TRB Transfer Length in [16:0]
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_NORMAL) | XHCI_TRB_IOC;
+
+    struct xhci_xfer_wait wait;
+    memset(&wait, 0, sizeof(wait));
+    wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
+    wait.slot_id       = (uint8_t)slot_id;
+    wait.ep_id         = (uint8_t)dci;
+    hc->current_xfer   = &wait;
+
+    xhci_wmb();
+    xhci_writel(&hc->db_base[slot_id], dci);
+
+    // Bulk/intr can take longer than a control transfer. 5 s is enough
+    // for QEMU to NAK-and-retry an interrupt mouse for a while.
+    int timeout_ms = 5000;
+    while (!wait.completed && timeout_ms > 0) {
+        xhci_drain_event_ring(hc);
+        if (wait.completed) break;
+        udelay(1000);
+        timeout_ms--;
+    }
+    hc->current_xfer = NULL;
+
+    if (!wait.completed) {
+        ERROR("normal xfer slot=%d dci=%d: timeout\n", slot_id, dci);
+        return -1;
+    }
+    if (wait.completion_code != XHCI_CC_SUCCESS &&
+        wait.completion_code != XHCI_CC_SHORT_PACKET) {
+        ERROR("normal xfer slot=%d dci=%d: cc=%u\n",
+              slot_id, dci, wait.completion_code);
+        return -1;
+    }
+    return (int)length - (int)wait.residual_len;
+}
+
+
+//
 // control-transfer plumbing on EP0
 //
 // A control transfer is a 3-TRB transfer description on an EP transfer ring:
@@ -970,10 +1201,15 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                                          uint8_t *out_iface_class,
                                          uint8_t *out_iface_subclass,
                                          uint8_t *out_iface_protocol,
-                                         uint8_t *out_iface_num_eps) {
+                                         uint8_t *out_iface_num_eps,
+                                         struct usb_endpoint *out_eps,
+                                         uint32_t out_eps_cap,
+                                         uint32_t *out_eps_count) {
     static const char *xfer_names[] = { "control", "isoch", "bulk", "intr" };
     uint16_t off = 0;
     int first_iface = 1;
+    int capturing_eps = 0;     // only capture endpoints belonging to the first interface
+    uint32_t n_eps = 0;
     while (off + 2 <= len) {
         uint8_t bLength         = buf[off];
         uint8_t bDescriptorType = buf[off + 1];
@@ -999,6 +1235,11 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                 if (out_iface_protocol) *out_iface_protocol = iface->bInterfaceProtocol;
                 if (out_iface_num_eps)  *out_iface_num_eps  = iface->bNumEndpoints;
                 first_iface = 0;
+                capturing_eps = 1;
+            } else {
+                // Endpoints from additional interfaces are logged but not
+                // captured -- Phase 6.4 only handles single-interface devices.
+                capturing_eps = 0;
             }
             break;
         }
@@ -1009,6 +1250,14 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                  slot_id,
                  USB_EP_NUM(ep->bEndpointAddress),
                  USB_EP_DIR_IN(ep->bEndpointAddress) ? "IN " : "OUT", xfer_names[xfer], ep->wMaxPacketSize, ep->bInterval);
+            if (capturing_eps && out_eps && n_eps < out_eps_cap) {
+                struct usb_endpoint *dst = &out_eps[n_eps++];
+                dst->address    = ep->bEndpointAddress;
+                dst->attributes = ep->bmAttributes;
+                dst->interval   = ep->bInterval;
+                dst->max_packet = ep->wMaxPacketSize & 0x7ff;
+                dst->active     = 1;
+            }
             break;
         }
         default:
@@ -1018,6 +1267,7 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
         }
         off += bLength;
     }
+    if (out_eps_count) *out_eps_count = n_eps;
 }
 
 static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
@@ -1109,7 +1359,8 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
         kmem_free(dev_desc);
         return -1;
     }
-    uint16_t total = cfg_hdr->wTotalLength;
+    uint16_t total      = cfg_hdr->wTotalLength;
+    uint8_t  config_val = cfg_hdr->bConfigurationValue;   // saved for SET_CONFIGURATION
     INFO("slot %d: config %u: %u iface(s), total=%u B, attr=0x%02x maxpower=%u mA\n",
          slot_id,
          cfg_hdr->bConfigurationValue, cfg_hdr->bNumInterfaces,
@@ -1138,10 +1389,43 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     }
     // Phase 6.3: capture the first interface's class triple so
     // usb_register_device can match drivers against it.
+    // Phase 6.4: capture the first interface's endpoint list so we can
+    // build EP contexts and allocate transfer rings for CONFIGURE_ENDPOINT.
     uint8_t iface_class = 0, iface_sub = 0, iface_proto = 0, iface_n_eps = 0;
+    struct usb_endpoint scratch_eps[USB_MAX_EPS_PER_DEV];
+    memset(scratch_eps, 0, sizeof(scratch_eps));
+    uint32_t parsed_n_eps = 0;
     xhci_parse_config_descriptor(slot_id, cfg, total,
-                                 &iface_class, &iface_sub, &iface_proto, &iface_n_eps);
+                                 &iface_class, &iface_sub, &iface_proto, &iface_n_eps,
+                                 scratch_eps, USB_MAX_EPS_PER_DEV, &parsed_n_eps);
     kmem_free(cfg);
+
+    // Phase 6.4: hand the parsed endpoints to xHCI's CONFIGURE_ENDPOINT,
+    // which allocates transfer rings, fills the input context, and
+    // transitions the slot from Addressed to Configured. Then issue
+    // SET_CONFIGURATION on the wire so the device-side endpoint state
+    // also transitions. Either order works in principle, but
+    // host-then-device matches the Linux/Windows convention.
+    if (parsed_n_eps > 0) {
+        if (xhci_configure_endpoint(hc, slot_id, (uint8_t)speed,
+                                    scratch_eps, parsed_n_eps) < 0) {
+            kmem_free(dev_desc);
+            return -1;
+        }
+        if (xhci_control_transfer(hc, slot_id,
+                                  USB_DIR_OUT,
+                                  USB_REQ_SET_CONFIGURATION,
+                                  config_val, 0, NULL, 0) < 0) {
+            ERROR("slot %d: SET_CONFIGURATION(%u) failed\n", slot_id, config_val);
+            kmem_free(dev_desc);
+            return -1;
+        }
+        uint8_t slot_state = (hc->device_ctxs[slot_id]->slot.fields[3] >> 27) & 0x1f;
+        INFO("slot %d: configured (config=%u, slot_state=%u, num_eps=%u)\n",
+             slot_id, config_val, slot_state, parsed_n_eps);
+    } else {
+        DEBUG("slot %d: no endpoints to configure (iface has only EP0)\n", slot_id);
+    }
 
     // build the usb_device handle and register it with the USB core
     struct usb_device *udev = usb_alloc_device();
@@ -1166,14 +1450,17 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     udev->iface_protocol = iface_proto;
     udev->iface_num_eps  = iface_n_eps;
     udev->num_configs    = dev_desc->bNumConfigurations;
+    udev->config_value   = (parsed_n_eps > 0) ? config_val : 0;
+    udev->num_endpoints  = parsed_n_eps;
+    memcpy(udev->endpoints, scratch_eps, sizeof(scratch_eps));
     udev->hc             = hc;
     hc->usb_devices[slot_id] = udev;
     usb_register_device(udev);
 
     kmem_free(dev_desc);
 
-    INFO("port %u enumerated as slot %d; awaiting Phase 6.4 CONFIGURE_ENDPOINT\n",
-         port, slot_id);
+    INFO("port %u enumerated as slot %d (config=%u, eps=%u)\n",
+         port, slot_id, udev->config_value, udev->num_endpoints);
     return slot_id;
 }
 
@@ -1495,6 +1782,18 @@ static void xhci_teardown(struct xhci_hc *hc) {
         kmem_free(hc->usb_devices);
         hc->usb_devices = NULL;
     }
+    if (hc->ep_rings) {
+        uint32_t total = (hc->max_slots + 1) * 32;
+        for (uint32_t i = 0; i < total; i++) {
+            struct xhci_ring *r = hc->ep_rings[i];
+            if (!r) continue;
+            if (r->trbs) kmem_free(r->trbs);
+            kmem_free(r);
+            hc->ep_rings[i] = NULL;
+        }
+        kmem_free(hc->ep_rings);
+        hc->ep_rings = NULL;
+    }
 }
 
 
@@ -1535,7 +1834,12 @@ static int xhci_init(struct xhci_hc *hc) {
     hc->input_ctxs   = kmem_mallocz(n * sizeof(struct xhci_input_ctx *));
     hc->ep0_rings    = kmem_mallocz(n * sizeof(struct xhci_ring));
     hc->usb_devices  = kmem_mallocz(n * sizeof(struct usb_device *));
-    if (!hc->device_ctxs || !hc->input_ctxs || !hc->ep0_rings || !hc->usb_devices) {
+    // Phase 6.4: per-slot-per-DCI transfer rings for non-EP0 endpoints.
+    // Indexed by [slot*32 + dci]. Entries 0,1 of each slot are unused
+    // (slot ctx and EP0 live in their own storage).
+    hc->ep_rings     = kmem_mallocz(n * 32 * sizeof(struct xhci_ring *));
+    if (!hc->device_ctxs || !hc->input_ctxs || !hc->ep0_rings ||
+        !hc->usb_devices || !hc->ep_rings) {
         ERROR("cannot allocate slot tracking arrays\n");
         goto fail;
     }

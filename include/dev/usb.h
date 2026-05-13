@@ -101,6 +101,25 @@ struct usb_endpoint_descriptor {
 } __attribute__((packed));
 
 //
+// Per-endpoint cache. Populated from each endpoint descriptor during
+// enumeration (Phase 6.4). The DCI is the xHCI Device Context Index
+// computed as ep_num*2 + (dir_in ? 1 : 0); we precompute it so class
+// drivers don't have to.
+//
+
+#define USB_MAX_EPS_PER_DEV 15      // EP1..EP15 (EP0 is implicit)
+
+struct usb_endpoint {
+    uint8_t  address;       // bEndpointAddress (bit 7 = IN, bits 3:0 = ep num)
+    uint8_t  attributes;    // bmAttributes (bits 1:0 = transfer type)
+    uint8_t  interval;      // bInterval (raw; not yet xHCI-encoded)
+    uint8_t  dci;            // xHCI Device Context Index, 2..31
+    uint16_t max_packet;    // wMaxPacketSize (low 11 bits)
+    uint8_t  active;        // 1 if populated, 0 if slot is unused
+    uint8_t  rsvd;
+};
+
+//
 // USB device handle
 //
 
@@ -126,6 +145,14 @@ struct usb_device {
     uint8_t  iface_subclass;
     uint8_t  iface_protocol;
     uint8_t  iface_num_eps;
+
+    // Active configuration value (after auto-activation during enumeration)
+    uint8_t  config_value;
+
+    // Parsed endpoint table. Populated for the first interface only.
+    // Use usb_find_endpoint() to look up by (ep_num, dir_in).
+    struct usb_endpoint endpoints[USB_MAX_EPS_PER_DEV];
+    uint8_t  num_endpoints;
 
     // Backing host controller (today always xHCI)
     struct xhci_hc *hc;
@@ -180,9 +207,20 @@ int usb_control_transfer(struct usb_device *dev,
                          uint16_t value, uint16_t index,
                          void *data, uint16_t length);
 
-// Issue a USB bulk transfer on the given endpoint number. Returns bytes transferred or -1.
+// Issue a USB bulk transfer on the given endpoint number. dir is
+// USB_DIR_IN or USB_DIR_OUT. Returns bytes transferred or -1.
 int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
                       void *data, size_t length, int dir);
+
+// Issue a USB interrupt transfer on the given endpoint number. dir is
+// USB_DIR_IN or USB_DIR_OUT. Returns bytes transferred or -1.
+int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
+                           void *data, size_t length, int dir);
+
+// Look up a parsed endpoint by (ep_num, dir_in). Returns NULL if no
+// such endpoint exists on the device's active interface.
+struct usb_endpoint *usb_find_endpoint(struct usb_device *dev,
+                                       uint8_t ep_num, int dir_in);
 
 // Composite helper: GET_DESCRIPTOR(type, index) into buf
 int usb_get_descriptor(struct usb_device *dev,

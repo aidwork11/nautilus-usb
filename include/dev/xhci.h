@@ -495,6 +495,8 @@ struct xhci_hc {
     struct xhci_device_ctx **device_ctxs;
     struct xhci_input_ctx  **input_ctxs;
     struct xhci_ring        *ep0_rings;     // EP0 transfer rings, one per slot
+    // Non-EP0 transfer rings indexed by [slot_id * 32 + dci]. NULL = not allocated.
+    struct xhci_ring       **ep_rings;
     struct usb_device      **usb_devices;   // HCI-agnostic per-slot handle
 
     // In-flight command (TODO, single in-flight right now).
@@ -535,5 +537,11 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id,
                           uint8_t bmRequestType, uint8_t bRequest,
                           uint16_t wValue, uint16_t wIndex,
                           void *buf, uint16_t wLength);
+
+// Phase 6.4: NORMAL TRB transfer on a non-EP0 endpoint. dci is the
+// xHCI Device Context Index (2..31). Used for bulk and interrupt;
+// the controller's EP_TYPE setting determines wire-level behavior.
+int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci,
+                         void *buf, uint16_t length);
 
 #endif // __XHCI_H__
