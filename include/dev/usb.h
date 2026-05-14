@@ -101,10 +101,7 @@ struct usb_endpoint_descriptor {
 } __attribute__((packed));
 
 //
-// Per-endpoint cache. Populated from each endpoint descriptor during
-// enumeration (Phase 6.4). The DCI is the xHCI Device Context Index
-// computed as ep_num*2 + (dir_in ? 1 : 0); we precompute it so class
-// drivers don't have to.
+// Per endpoint cache -populated from each endpoint descriptor during enumeration
 //
 
 #define USB_MAX_EPS_PER_DEV 15      // EP1..EP15 (EP0 is implicit)
@@ -154,7 +151,7 @@ struct usb_device {
     struct usb_endpoint endpoints[USB_MAX_EPS_PER_DEV];
     uint8_t  num_endpoints;
 
-    // Backing host controller (today always xHCI)
+    // Backing host controller
     struct xhci_hc *hc;
 
     // Linkage on the global device list
