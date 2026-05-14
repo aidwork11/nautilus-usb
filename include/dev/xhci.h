@@ -531,16 +531,14 @@ struct xhci_hc {
 int xhci_pci_init(struct naut_info *naut);
 int xhci_pci_deinit(void);
 
-// Phase 6.2: exposed for the USB-layer transfer API. usb_control_transfer
-// dispatches to this when dev->hc points at an xHCI controller.
+// exposed for the USB-layer transfer API. usb_control_transfer dispatches to this
 int xhci_control_transfer(struct xhci_hc *hc, int slot_id,
                           uint8_t bmRequestType, uint8_t bRequest,
                           uint16_t wValue, uint16_t wIndex,
                           void *buf, uint16_t wLength);
 
-// Phase 6.4: NORMAL TRB transfer on a non-EP0 endpoint. dci is the
-// xHCI Device Context Index (2..31). Used for bulk and interrupt;
-// the controller's EP_TYPE setting determines wire-level behavior.
+// NORMAL TRB transfer on a non-EP0 endpoint.
+// Used for bulk and interrupt
 int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci,
                          void *buf, uint16_t length);
 
