@@ -6,6 +6,8 @@
 #include <nautilus/naut_string.h>
 #include <nautilus/idt.h>            // idt_find_and_reserve_range
 #include <nautilus/irq.h>            // register_int_handler
+#include <nautilus/waitqueue.h>      // nk_wait_queue_*
+#include <nautilus/timer.h>          // nk_timer_*, nk_timer_get_thread_default
 #include <dev/apic.h>                // apic_do_eoi
 #include <dev/pci.h>
 #include <dev/xhci.h>
@@ -425,16 +427,58 @@ static void xhci_handle_port_status_change(struct xhci_hc *hc, struct xhci_trb *
     }
 }
 
-// Walks the ring while the next TRB's cycle bit match the consumer cycle state
-// writes ERDP at the end (with EHB=1) to ack the event
-static void xhci_drain_event_ring(struct xhci_hc *hc) {
+// Match a COMMAND_COMPLETION event against the cmd_waiters list. Caller
+// holds hc->lock. Returns 1 if a waiter was matched and marked
+// complete, 0 otherwise.
+static int xhci_match_cmd_event(struct xhci_hc *hc, uint64_t cmd_trb_phys,
+                                uint8_t cc, uint8_t sid) {
+    struct xhci_cmd_wait *w;
+    list_for_each_entry(w, &hc->cmd_waiters, node) {
+        if (w->cmd_trb_phys == cmd_trb_phys) {
+            w->completion_code = cc;
+            w->slot_id         = sid;
+            xhci_wmb();
+            w->completed       = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Match a TRANSFER_EVENT against the xfer_waiters list. Caller holds
+// hc->lock. We match on (slot, ep, last_trb_phys); the last_trb_phys
+// covers the case where two outstanding TDs on the same EP both stay
+// in flight (rare today but allowed by xHCI).
+static int xhci_match_xfer_event(struct xhci_hc *hc, uint64_t last_trb_phys,
+                                 uint8_t sid, uint8_t eid, uint8_t cc,
+                                 uint32_t residual) {
+    struct xhci_xfer_wait *w;
+    list_for_each_entry(w, &hc->xfer_waiters, node) {
+        if (w->slot_id == sid && w->ep_id == eid &&
+            w->last_trb_phys == last_trb_phys) {
+            w->completion_code = cc;
+            w->residual_len    = residual;
+            xhci_wmb();
+            w->completed       = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Walks the ring while the next TRB's cycle bit matches the consumer
+// cycle state, dispatches by type, advances ERDP. Returns nonzero if
+// any waiter was marked complete (caller wakes hc->waitq outside the
+// lock). Caller holds hc->lock.
+static int xhci_drain_locked(struct xhci_hc *hc) {
     struct xhci_ring *er = &hc->event_ring;
     uint8_t *ir = (uint8_t *)hc->rt_base + XHCI_RT_IR_BASE;
     int n = 0;
+    int woke = 0;
 
     while (1) {
-        struct xhci_trb *trb = &er->trbs[er->deq]; // get current trb
-        xhci_rmb(); // read memory barrier. cycle check must be last
+        struct xhci_trb *trb = &er->trbs[er->deq];
+        xhci_rmb();
         uint32_t ctrl = trb->control;
         if ((ctrl & XHCI_TRB_CYCLE) != er->cycle) {
             break;   // hardware hasn't filled this slot yet
@@ -446,36 +490,22 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             xhci_handle_port_status_change(hc, trb);
             break;
         case XHCI_TRB_COMMAND_COMPLETION: {
-            // a COMMAND_COMPLETE trb holds the phys address of its corresponding command trb in the param field
-            uint8_t cc  = XHCI_TRB_GET_COMP(trb->status); // completion code
-            uint8_t sid = (ctrl >> 24) & 0xff; // slot id
+            uint8_t cc  = XHCI_TRB_GET_COMP(trb->status);
+            uint8_t sid = (ctrl >> 24) & 0xff;
             DEBUG("event: command completion (cc=%u slot=%u trb=0x%lx)\n",
                   cc, sid, trb->param);
-            volatile struct xhci_cmd_wait *w = hc->current_cmd;
-            if (w && w->cmd_trb_phys == trb->param) { // if there is a command in flight and if the waiter is waiting for this specific command
-                // the issuer is waiting on .completed. when it sees that going high, it reads the cc and sid
-                w->completion_code = cc;
-                w->slot_id         = sid;
-                xhci_wmb();
-                w->completed       = 1;
-            }
+            if (xhci_match_cmd_event(hc, trb->param, cc, sid)) woke = 1;
             break;
         }
         case XHCI_TRB_TRANSFER_EVENT: {
-            // control carries the slot id and ep id of the EP that produced the event
             uint8_t  cc       = XHCI_TRB_GET_COMP(trb->status);
             uint8_t  sid      = XHCI_TRB_GET_SLOT(ctrl);
             uint8_t  eid      = XHCI_TRB_GET_EP(ctrl);
             uint32_t residual = trb->status & 0xffffffu;
             DEBUG("event: transfer (cc=%u slot=%u ep=%u resid=%u trb=0x%lx)\n",
                   cc, sid, eid, residual, trb->param);
-            volatile struct xhci_xfer_wait *w = hc->current_xfer;
-            if (w && w->slot_id == sid && w->ep_id == eid) {
-                w->completion_code = cc;
-                w->residual_len    = residual;
-                xhci_wmb();
-                w->completed       = 1;
-            }
+            if (xhci_match_xfer_event(hc, trb->param, sid, eid, cc, residual))
+                woke = 1;
             break;
         }
         default:
@@ -483,7 +513,7 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
             break;
         }
 
-        er->deq++; // advance on the ring
+        er->deq++;
         if (er->deq == XHCI_RING_SIZE) {
             er->deq = 0;
             er->cycle ^= 1;
@@ -491,13 +521,24 @@ static void xhci_drain_event_ring(struct xhci_hc *hc) {
         n++;
     }
 
-    // Update ERDP to current dequeue position
     uint64_t phys = er->trbs_phys + er->deq * sizeof(struct xhci_trb);
-    // mask off the flags, then set event handler busy (W1C) to tell hardware that processing finished
     xhci_writeq(ir + XHCI_IR_ERDP, (phys & XHCI_ERDP_PTR_MASK) | XHCI_ERDP_EHB);
 
     if (n > 0) {
-        DEBUG("drained %d event(s); deq=%u cycle=%u\n", n, er->deq, er->cycle);
+        DEBUG("drained %d event(s); deq=%u cycle=%u woke=%d\n",
+              n, er->deq, er->cycle, woke);
+    }
+    return woke;
+}
+
+// Thread-context wrapper: take the lock, drain, release, wake. The IRQ
+// handler uses a slightly different path that's already-in-IRQ aware.
+static void xhci_drain_event_ring(struct xhci_hc *hc) {
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+    int woke = xhci_drain_locked(hc);
+    spin_unlock_irq_restore(&hc->lock, flags);
+    if (woke) {
+        nk_wait_queue_wake_all(hc->waitq);
     }
 }
 
@@ -600,30 +641,91 @@ static uint64_t xhci_cmd_enqueue(struct xhci_hc *hc, uint64_t param, uint32_t st
     return trb_phys;
 }
 
+// cond_check helpers for nk_wait_queue_sleep_extended_multiple.
+// Driver-private completion flag.
+static int xhci_flag_set(void *s) {
+    return *(volatile uint8_t *)s != 0;
+}
+// Timer-expired flag. nk_timer_t goes through INACTIVE -> ACTIVE ->
+// SIGNALLED on expiry; cancel also moves ACTIVE -> SIGNALLED.
+static int xhci_timer_signalled(void *s) {
+    nk_timer_t *t = s;
+    return __sync_fetch_and_add(&t->state, 0) == NK_TIMER_SIGNALLED;
+}
+
+// Sleep until *flag is nonzero or `timeout_ms` elapses. Returns 0 on
+// completion, -1 on timeout. Uses the per-thread default timer to
+// avoid a per-call allocation. Caller MUST NOT hold hc->lock.
+//
+// Implementation note: we wake on `slice_ms` intervals and explicitly
+// drain the event ring on each wake. The waitq is also woken from
+// the IRQ handler's drain, so when MSI-X is delivering interrupts
+// the wake is near-immediate. When it isn't (QEMU has intermittent
+// trouble routing MSI-X through the kernel APIC code), the periodic
+// re-drain still picks up completions — at worst `slice_ms` of
+// latency per command. Cost is one timer set/cancel and one ring
+// scan per slice.
+static int xhci_wait_completion(struct xhci_hc *hc,
+                                volatile uint8_t *flag,
+                                int timeout_ms) {
+    nk_timer_t *timer = nk_timer_get_thread_default();
+    if (!timer) {
+        ERROR("no default timer; cannot wait\n");
+        return -1;
+    }
+    const int slice_ms = 20;
+    int elapsed_ms = 0;
+
+    while (!*flag && elapsed_ms < timeout_ms) {
+        // Catch any events that landed since the last drain. If the
+        // IRQ is firing this is harmless (drain is idempotent).
+        xhci_drain_event_ring(hc);
+        if (*flag) break;
+
+        nk_timer_set(timer, (uint64_t)slice_ms * 1000000ULL,
+                     NK_TIMER_WAIT_ONE, NULL, NULL, 0);
+        nk_timer_start(timer);
+
+        nk_wait_queue_t *qs[2]   = { hc->waitq, timer->waitq };
+        int (*checks[2])(void *) = { xhci_flag_set, xhci_timer_signalled };
+        void *states[2]          = { (void *)flag, timer };
+        nk_wait_queue_sleep_extended_multiple(2, qs, checks, states);
+
+        // Cancel idempotently — if the timer fired it's already SIGNALLED.
+        nk_timer_cancel(timer);
+        elapsed_ms += slice_ms;
+    }
+    return *flag ? 0 : -1;
+}
+
 // Issue a command and wait for its COMMAND_COMPLETION_EVENT on the event ring
 // On success, returns 0 and writes the slot id (if non-NULL) from the
 // event's slot field.
 static int xhci_run_command(struct xhci_hc *hc, uint64_t param, uint32_t status, uint32_t control, uint8_t *out_slot_id, const char *what) {
     struct xhci_cmd_wait wait;
     memset(&wait, 0, sizeof(wait));
+    INIT_LIST_HEAD(&wait.node);
 
+    // Single critical section: enqueue TRB, register waiter, ring
+    // doorbell. If the IRQ fires between these three writes the
+    // drain might not find the waiter, and the wakeup is lost.
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
     wait.cmd_trb_phys = xhci_cmd_enqueue(hc, param, status, control);
-    hc->current_cmd = &wait;
-
-    // Order: TRB write -> doorbell write. wmb prevents the doorbell from racing past the TRB store.
+    list_add_tail(&wait.node, &hc->cmd_waiters);
     xhci_wmb();
     xhci_writel(&hc->db_base[XHCI_DB_HOST], XHCI_DB_CMD_DOORBELL);
+    spin_unlock_irq_restore(&hc->lock, flags);
 
-    int timeout_ms = 1000;
-    while (!wait.completed && timeout_ms > 0) {
-        xhci_drain_event_ring(hc); // this will resolve the waiter (single threaded)
-        if (wait.completed) break;
-        udelay(1000);
-        timeout_ms--;
-    }
-    hc->current_cmd = NULL;
+    int rc = xhci_wait_completion(hc, &wait.completed, 1000);
 
-    if (!wait.completed) {
+    // Pull the waiter back off the list whether we completed or timed
+    // out. On timeout the IRQ could still match this waiter, so we
+    // can't return until it's unlinked.
+    flags = spin_lock_irq_save(&hc->lock);
+    list_del_init(&wait.node);
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    if (rc < 0) {
         ERROR("%s: timeout waiting for completion\n", what);
         return -1;
     }
@@ -986,31 +1088,32 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
         return -1;
     }
 
-    xhci_ring_reserve(r, 1);
-
-    uint32_t status = length;   // TRB Transfer Length in [16:0]
+    uint32_t status  = length;   // TRB Transfer Length in [16:0]
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_NORMAL) | XHCI_TRB_IOC; // interrupt on completion
 
     struct xhci_xfer_wait wait;
     memset(&wait, 0, sizeof(wait));
-    wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
-    wait.slot_id       = (uint8_t)slot_id;
-    wait.ep_id         = (uint8_t)dci;
-    hc->current_xfer   = &wait;
+    INIT_LIST_HEAD(&wait.node);
+    wait.slot_id = (uint8_t)slot_id;
+    wait.ep_id   = (uint8_t)dci;
 
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+    xhci_ring_reserve(r, 1);
+    wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
+    list_add_tail(&wait.node, &hc->xfer_waiters);
     xhci_wmb();
     xhci_writel(&hc->db_base[slot_id], dci);
+    spin_unlock_irq_restore(&hc->lock, flags);
 
-    int timeout_ms = 5000;
-    while (!wait.completed && timeout_ms > 0) {
-        xhci_drain_event_ring(hc);
-        if (wait.completed) break;
-        udelay(1000);
-        timeout_ms--;
-    }
-    hc->current_xfer = NULL;
+    // Bulk/intr can take longer than a control transfer. 5 s is enough
+    // for QEMU to NAK-and-retry an interrupt mouse for a while.
+    int rc = xhci_wait_completion(hc, &wait.completed, 5000);
 
-    if (!wait.completed) {
+    flags = spin_lock_irq_save(&hc->lock);
+    list_del_init(&wait.node);
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    if (rc < 0) {
         ERROR("normal xfer slot=%d dci=%d: timeout\n", slot_id, dci);
         return -1;
     }
@@ -1070,8 +1173,6 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType
     int dir_in   = (bmRequestType & USB_DIR_IN) != 0;
     int has_data = wLength > 0;
     uint32_t n_trbs = has_data ? 3u : 2u; // control transfers have setup and status; data transfers have setup, data, status
-    
-    xhci_ring_reserve(r, n_trbs);
 
     // SETUP
     uint64_t setup_param =
@@ -1087,20 +1188,14 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType
     uint32_t setup_ctl = XHCI_TRB_TYPE(XHCI_TRB_SETUP_STAGE)
                        | XHCI_TRB_IDT
                        | setup_trt;
-    xhci_xfer_enqueue(r, setup_param, setup_status, setup_ctl);
 
-    // DATA
-    if (has_data) {
-        uint32_t data_ctl = XHCI_TRB_TYPE(XHCI_TRB_DATA_STAGE);
-        if (dir_in) {
-            // controller will write data into the buf. if !dir_in the controller reads from the buf
-            data_ctl |= XHCI_TRB_DIR_IN;
-        }
-        xhci_xfer_enqueue(r, (uint64_t)buf, (uint32_t)wLength, data_ctl);
+    uint32_t data_ctl = XHCI_TRB_TYPE(XHCI_TRB_DATA_STAGE);
+    if (dir_in) {
+        // controller will write data into the buf. if !dir_in the controller reads from the buf
+        data_ctl |= XHCI_TRB_DIR_IN;
     }
 
-    // STATUS
-    // opposite direction of data or in if no data stage
+    // STATUS - opposite direction of data, or IN if no data stage.
     // zero length, IOC=1 so we get a single completion event.
     int status_dir_in = !dir_in || !has_data;
     uint32_t status_ctl = XHCI_TRB_TYPE(XHCI_TRB_STATUS_STAGE) | XHCI_TRB_IOC;
@@ -1110,27 +1205,31 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType
 
     struct xhci_xfer_wait wait;
     memset(&wait, 0, sizeof(wait));
-    wait.last_trb_phys = xhci_xfer_enqueue(r, 0, 0, status_ctl);
-    wait.slot_id       = (uint8_t)slot_id;
-    wait.ep_id         = XHCI_EP0_ID;
-    hc->current_xfer   = &wait;
+    INIT_LIST_HEAD(&wait.node);
+    wait.slot_id = (uint8_t)slot_id;
+    wait.ep_id   = XHCI_EP0_ID;
 
-    // wmb so the doorbell doesn't race past the in-flight TRB stores.
+    // Atomic: reserve TD-sized run on the ring, lay down 2 or 3 TRBs,
+    // register the waiter, ring the doorbell.
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+    xhci_ring_reserve(r, n_trbs);
+    xhci_xfer_enqueue(r, setup_param, setup_status, setup_ctl);
+    if (has_data) {
+        xhci_xfer_enqueue(r, (uint64_t)buf, (uint32_t)wLength, data_ctl);
+    }
+    wait.last_trb_phys = xhci_xfer_enqueue(r, 0, 0, status_ctl);
+    list_add_tail(&wait.node, &hc->xfer_waiters);
     xhci_wmb();
     xhci_writel(&hc->db_base[slot_id], XHCI_EP0_ID);
+    spin_unlock_irq_restore(&hc->lock, flags);
 
-    int timeout_ms = 1000;
-    while (!wait.completed && timeout_ms > 0) {
-        xhci_drain_event_ring(hc);
-        if (wait.completed) {
-            break;
-        }
-        udelay(1000);
-        timeout_ms--;
-    }
-    hc->current_xfer = NULL;
+    int rc = xhci_wait_completion(hc, &wait.completed, 1000);
 
-    if (!wait.completed) {
+    flags = spin_lock_irq_save(&hc->lock);
+    list_del_init(&wait.node);
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    if (rc < 0) {
         ERROR("control xfer slot=%d: timeout waiting for completion\n", slot_id);
         return -1;
     }
@@ -1758,6 +1857,10 @@ static void xhci_teardown(struct xhci_hc *hc) {
         kmem_free(hc->ep_rings);
         hc->ep_rings = NULL;
     }
+    if (hc->waitq) {
+        nk_wait_queue_destroy(hc->waitq);
+        hc->waitq = NULL;
+    }
 }
 
 
@@ -1793,6 +1896,14 @@ static int xhci_init(struct xhci_hc *hc) {
         ERROR("64-byte context size not supported (CSZ=1)\n");
         return -1;
     }
+    INIT_LIST_HEAD(&hc->cmd_waiters);
+    INIT_LIST_HEAD(&hc->xfer_waiters);
+    hc->waitq = nk_wait_queue_create("xhci-waitq");
+    if (!hc->waitq) {
+        ERROR("cannot allocate wait queue\n");
+        return -1;
+    }
+
     size_t n = (size_t)hc->max_slots + 1;
     hc->device_ctxs  = kmem_mallocz(n * sizeof(struct xhci_device_ctx *));
     hc->input_ctxs   = kmem_mallocz(n * sizeof(struct xhci_input_ctx *));
@@ -1831,7 +1942,10 @@ static int xhci_init(struct xhci_hc *hc) {
     }
 
     // Phase 4: power on root hub ports and pick up any devices that were
-    // already plugged in when the controller started.
+    // already plugged in when the controller started. The waits inside
+    // sleep on hc->waitq; xhci_pci_init starts a fallback idle thread on
+    // CPU 0 before reaching here so the scheduler has someone to switch
+    // to when we sleep.
     xhci_scan_ports(hc);
 
     return 0;
@@ -1912,6 +2026,20 @@ int xhci_pci_init(struct naut_info *naut) {
     if (!xhci_controllers_inited) {
         INIT_LIST_HEAD(&xhci_controllers);
         xhci_controllers_inited = 1;
+    }
+
+    // Start a fallback idle thread on CPU 0. The boot thread is the
+    // only runnable thread on CPU 0 at this point; any code below
+    // that sleeps (xhci_wait_completion in the command/transfer
+    // issue paths) would otherwise panic the scheduler with
+    // "APERIODIC QUEUE IS EMPTY" — it needs at least one other thread
+    // to switch to. The test harness does the same trick in
+    // nk_run_tests for tests that block.
+    extern void idle(void *, void **);
+    if (nk_thread_start(idle, NULL, NULL, 0,
+                        TSTACK_DEFAULT, NULL, 0 /* bind CPU 0 */) != 0) {
+        ERROR("could not start fallback idle thread; aborting probe\n");
+        return -1;
     }
 
     // pci_map_over_devices uses 0xffff as "match any" for both vendor and device

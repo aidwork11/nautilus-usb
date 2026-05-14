@@ -466,30 +466,101 @@ testing plan.
 
 ## Phase 7: Synchronization and Event Handling
 
-### 7.1 IRQ Handler
+### 7.1 IRQ Handler — **done**
+
+Implemented in `xhci_irq_handler` (src/dev/xhci.c). On every MSI-X interrupt:
+
+1. Acks `USBSTS.EINT` (W1C) — the controller-wide event indicator.
+2. Acks `IMAN.IP` (W1C) on interrupter 0 — the per-interrupter pending flag.
+3. Calls `xhci_drain_event_ring()` — which takes `hc->lock`, dequeues every TRB
+   whose cycle matches the driver's consumer cycle, matches each completion
+   against the waiter lists, advances ERDP, releases the lock, and wakes
+   `hc->waitq` if any waiter was matched.
+4. Calls `apic_do_eoi()` to release the LAPIC.
+
+No softirq offload or per-CPU steering — fine for QEMU's emulated controller.
+
+**Caveat:** in QEMU we observe MSI-X interrupts arriving inconsistently for this
+controller's vector. The wait path in 7.2 handles this by also re-draining on
+its periodic wakeups, so completions never get stuck behind a missed interrupt.
+The IRQ-driven path stays correct on hardware where MSI-X delivery is reliable.
+
+### 7.2 Command / Transfer Synchronization — **done**
+
+Waiters live in two lists hanging off `struct xhci_hc`:
 
 ```c
-static int xhci_irq_handler(excp_entry_t *e, excp_vec_t v, void *priv) {
-    struct xhci_hc *hc = priv;
-    // clear IMAN.IP
-    // dequeue all pending TRBs from event ring
-    // dispatch by TRB type: completion, transfer, port status change
-    // advance ERDP, write back to register
-    apic_do_eoi();
-    return 0;
-}
+struct list_head cmd_waiters;     // xhci_cmd_wait nodes
+struct list_head xfer_waiters;    // xhci_xfer_wait nodes
 ```
 
-### 7.2 Command Completion Synchronization
+Each waiter is stack-allocated by its issuer, linked into the appropriate list
+under `hc->lock`, and matched by the drain code:
 
-For initial bring-up, a simple spin-wait on a volatile flag set by the IRQ handler is
-acceptable. Long-term: use NK's condition/wait primitives if available, or a polling fallback
-when interrupts are not yet active.
+- commands by `cmd_trb_phys` (the COMMAND_COMPLETION event's param field),
+- transfers by `(slot_id, ep_id, last_trb_phys)`.
 
-### 7.3 Event Ring Advance
+The match key uses the last TRB's physical address so concurrent TDs on the
+same endpoint never collide.
 
-After processing N events, update `ERDP` to the physical address of the new dequeue pointer
-with `ERDP.EHB` (event handler busy) bit set to acknowledge.
+Issuers run a common helper, `xhci_wait_completion(hc, &wait.completed,
+timeout_ms)`, which uses `nk_wait_queue_sleep_extended_multiple` on
+`(hc->waitq, per-thread timer waitq)`. Wake paths:
+
+- **IRQ-driven:** `xhci_drain_event_ring` from `xhci_irq_handler` sets
+  `wait.completed`, releases the lock, and calls `nk_wait_queue_wake_all`. The
+  sleeping issuer's cond-check sees the flag and the multi-wait returns.
+- **Timer fallback:** if no IRQ fires within a slice (currently 20 ms), the
+  timer's waitq wakes the issuer; it explicitly drains the ring, re-checks,
+  and sleeps again. This bounds latency to `slice_ms` even when MSI-X delivery
+  is broken.
+- **Timeout:** the total elapsed time across slices caps each call at 1 s
+  (commands, EP0) or 5 s (bulk/intr).
+
+After waking, the issuer takes `hc->lock` to unlink its waiter — necessary
+because a late-arriving IRQ might otherwise touch a freed stack frame.
+
+Locking discipline:
+- `hc->lock` guards the cmd ring's enq/cycle, every transfer ring's enq/cycle,
+  the event ring's deq/cycle, and both waiter lists.
+- Issuers take it `spin_lock_irq_save` before enqueueing a TRB + linking the
+  waiter + ringing the doorbell, and release it before going to sleep.
+- The IRQ handler also goes through `spin_lock_irq_save` (no-op from interrupt
+  context but cheap and correct); `nk_wait_queue_wake_all` is called outside
+  the lock to minimize hold time.
+
+### 7.3 Event Ring Advance — **done**
+
+`xhci_drain_locked()` walks events while the cycle bit matches the driver's
+expected state, processes each, then writes ERDP at the end:
+
+```c
+uint64_t phys = er->trbs_phys + er->deq * sizeof(struct xhci_trb);
+xhci_writeq(ir + XHCI_IR_ERDP, (phys & XHCI_ERDP_PTR_MASK) | XHCI_ERDP_EHB);
+```
+
+`XHCI_ERDP_EHB` ("Event Handler Busy") is W1C — writing 1 acknowledges to the
+controller that the driver has caught up. The controller can then re-arm
+interrupts. Wraparound at `XHCI_RING_SIZE` toggles the driver's cycle bit.
+
+### Boot-time bootstrap
+
+`xhci_pci_init` starts a fallback `idle` thread bound to CPU 0 before probing.
+Without it, the boot thread (the only runnable thread on CPU 0 at that point)
+would call `nk_sched_sleep` from `xhci_wait_completion` and panic the scheduler
+with "APERIODIC QUEUE IS EMPTY". The test harness (`nk_run_tests`) uses the
+same trick.
+
+### Current state summary
+
+| Sub-phase | Status | Notes                                                              |
+|-----------|--------|--------------------------------------------------------------------|
+| 7.1       | done   | Drain-and-wake handler; no softirq offload                         |
+| 7.2       | done   | Sleep + IRQ-wake + 20ms re-drain fallback; multi-in-flight via list|
+| 7.3       | done   | ERDP advance with EHB ack on every drain                           |
+
+Mass storage and other class drivers that want concurrent endpoints (e.g.
+bulk-IN and bulk-OUT in flight simultaneously) can now do so safely.
 
 ---
 
