@@ -437,9 +437,8 @@ struct xhci_ring {
     uint8_t          rsvd[3];
 };
 
-// In-flight command tracking. Lives on the issuer's stack and is
-// linked into hc->cmd_waiters until the matching COMMAND_COMPLETION
-// event arrives. Match key is cmd_trb_phys (event TRB's param field).
+// In-flight command tracking
+// linked into hc->cmd_waiters
 struct xhci_cmd_wait {
     struct list_head    node;
     uint64_t            cmd_trb_phys;       // physical addr of the issued command TRB
@@ -449,10 +448,8 @@ struct xhci_cmd_wait {
     uint8_t             rsvd;
 };
 
-// In-flight transfer tracking. Lives on the issuer's stack and is
-// linked into hc->xfer_waiters until the matching TRANSFER_EVENT
-// arrives. Match key is (slot_id, ep_id, last_trb_phys) so concurrent
-// transfers on different endpoints of one slot don't collide.
+// In-flight transfer tracking
+// linked into hc->xfer_waiters
 struct xhci_xfer_wait {
     struct list_head    node;
     uint64_t            last_trb_phys;
@@ -507,9 +504,8 @@ struct xhci_hc {
     struct xhci_ring       **ep_rings;
     struct usb_device      **usb_devices;   // HCI-agnostic per-slot handle
 
-    // In-flight cmd / transfer waiters. Multiple issuers can have
-    // requests outstanding concurrently; the drain matches each event
-    // against the appropriate list and wakes hc->waitq.
+    // In-flight cmd / transfer waiters.
+    // the drain matches each event against the appropriate list and wakes hc->waitq
     struct list_head     cmd_waiters;
     struct list_head     xfer_waiters;
 
@@ -518,14 +514,10 @@ struct xhci_hc {
     uint64_t            pending_port_enum;
 
     //Synchronization. hc->lock guards: cmd ring + per-EP transfer ring
-    // enqueue state, event ring drain state, and both waiter lists.
-    // Issuers take it irq-save; the IRQ handler takes it bare (already
-    // in interrupt context).
+    // enqueue state, event ring drain state, and both waiter lists
     spinlock_t           lock;
 
-    // Waiters sleep here. Woken by the IRQ handler's drain after each
-    // event batch is processed. Cond-check uses the per-waiter
-    // `completed` flag, so spurious wakes are harmless.
+    // Woken by the IRQ handler's drain after each event batch is processed
     nk_wait_queue_t     *waitq;
 
     // Interrupt routing 
