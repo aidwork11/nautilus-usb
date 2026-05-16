@@ -11,6 +11,9 @@
 #include <dev/apic.h>                // apic_do_eoi
 #include <dev/pci.h>
 #include <dev/xhci.h>
+#ifdef NAUT_CONFIG_USB_MSC
+#include <dev/usb_msc.h>
+#endif
 
 
 #ifndef NAUT_CONFIG_DEBUG_XHCI
@@ -2012,6 +2015,13 @@ int xhci_pci_init(struct naut_info *naut) {
         ERROR("could not start fallback idle thread; aborting probe\n");
         return -1;
     }
+
+#ifdef NAUT_CONFIG_USB_MSC
+    // Register class drivers before any device enumerates. The xHCI
+    // probe path walks the driver table inside usb_register_device,
+    // so the driver must be in the table by then.
+    usb_msc_register();
+#endif
 
     // pci_map_over_devices uses 0xffff as "match any" for both vendor and device
     int rc = pci_map_over_devices(xhci_probe, 0xffff, 0xffff, NULL);

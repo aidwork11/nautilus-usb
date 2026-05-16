@@ -239,6 +239,21 @@ config DEBUG_XHCI
     help
       Turn on debug prints for the xHCI driver
 
+config USB_MSC
+    bool "USB Mass Storage Class driver"
+    depends on XHCI
+    default y
+    help
+      Bulk-Only Transport + SCSI transparent. Probes any USB device
+      whose interface advertises class=8, subclass=6, protocol=0x50.
+
+config DEBUG_USB_MSC
+    bool "Debug USB MSC"
+    depends on DEBUG_PRINTS && USB_MSC
+    default n
+    help
+      Turn on debug prints for the USB Mass Storage class driver
+
 
 config RAMDISK
     bool "RAM Disk Support"
