@@ -96,4 +96,16 @@ int usb_msc_read10(struct usb_msc_dev *msc,
 // Dump all bound MSC devices
 void usb_msc_dump(void);
 
+//
+// Compile-time size checks against the USB MSC BOT 1.0 / SCSI specs.
+// Wire formats — any padding or sizing drift would corrupt every
+// command we send or response we parse.
+//
+_Static_assert(sizeof(struct usb_msc_cbw)       == 31,
+               "usb_msc_cbw must be 31 bytes on the wire");
+_Static_assert(sizeof(struct usb_msc_csw)       == 13,
+               "usb_msc_csw must be 13 bytes on the wire");
+_Static_assert(sizeof(struct scsi_inquiry_data) == 36,
+               "scsi_inquiry_data prefix must be 36 bytes");
+
 #endif // __USB_MSC_H__
