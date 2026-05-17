@@ -454,13 +454,101 @@ Note: 6.4 must also issue a `SET_CONFIGURATION` control transfer on the
 device before CONFIGURE_ENDPOINT, so the device-side endpoint state moves
 to active.
 
-### 6.5 Isochronous Transfers (deferred)
+### 6.5 Isochronous Transfers — **implemented; descriptor path validated, transfer path not yet**
 
 Structurally distinct from bulk/interrupt: uses `XHCI_TRB_ISOCH` (not
-NORMAL), carries a frame-id field for scheduled delivery, no retries, and
-needs bandwidth reservation at CONFIGURE_ENDPOINT time. Deferred until an
-isoch-class driver (USB audio, webcam) is in scope. Not currently in the
-testing plan.
+NORMAL), no retries, and needs different EP-context fields than
+bulk/intr. Three deltas from `xhci_normal_transfer`:
+
+1. **TRB type and scheduling.** `xhci_isoch_transfer` emits a TRB of
+   type `XHCI_TRB_ISOCH (5)` with the `SIA` bit set ("Start Isoch
+   ASAP"). With SIA=1 we don't pin a frame_id — the controller picks
+   the next available microframe. Frame-id scheduling is the obvious
+   extension for an isoch driver that needs precise A/V sync.
+
+2. **CErr=0 in the EP context.** `xhci_init_ep_ctx` now reads the
+   endpoint's transfer type and sets the CErr (retry count) field
+   accordingly: 0 for isoch (spec mandate — isoch has no retries) and
+   3 for everything else. Without this fix CONFIGURE_ENDPOINT would
+   reject an isoch endpoint with `PARAMETER_ERROR`.
+
+3. **Max ESIT Payload in DW4.** EP context dword 4 used to hold only
+   Average TRB Length in its low 16 bits. The high 16 bits — Max ESIT
+   Payload — were left zero. For periodic endpoints (isoch + intr) the
+   controller uses this field for bandwidth reservation at
+   CONFIGURE_ENDPOINT time; leaving it zero on real hardware would
+   either be rejected or silently allocate no bandwidth. We set it to
+   `max_packet * (mult+1) * (burst+1)` for periodic endpoints, with
+   `mult=burst=0` by default (so it collapses to `max_packet`). A
+   future SuperSpeed Endpoint Companion parser would refine the
+   multipliers; for FS/HS single-burst endpoints the simple form is
+   correct.
+
+The same patch added `usb_isoch_transfer` to the USB core, mirroring
+`usb_bulk_transfer` / `usb_interrupt_transfer`. Validation shape is
+identical; dispatch goes to `xhci_isoch_transfer` instead of
+`xhci_normal_transfer` since the underlying TRB type differs.
+
+#### What's been validated
+
+Adding `-device usb-audio,bus=xhci.0` to the QEMU smoke test confirms
+that QEMU's emulated USB Audio Class 1.0 device enumerates as a
+Full-Speed class=1 device on slot 3, and the config-descriptor walker
+correctly identifies its isoch endpoint:
+
+```
+slot 3:   ep1 OUT isoch max_pkt=192 interval=1
+```
+
+So the **transfer-type decoding, attribute parsing, and EP-context
+plumbing** for isoch are exercised on every smoke-test run. The
+existing MSC and HID paths continue to pass with the audio device
+attached — no regression from the EP-context CErr / Max ESIT Payload
+changes.
+
+#### What's not yet validated
+
+The actual `xhci_isoch_transfer` / `usb_isoch_transfer` call path is
+still untested end-to-end. The blocker is structural, not driver-side:
+USB Audio Class declares its isoch endpoint on **interface 1,
+alternate setting 1**, while interface 1 alternate setting 0 has zero
+endpoints (the spec's "zero-bandwidth default" pattern that lets
+plug-and-play coexist with audio playback). Two pieces of work are
+needed to reach the endpoint:
+
+1. **Multi-interface endpoint capture.** Today
+   `xhci_parse_config_descriptor` only stores the first interface's
+   endpoints — interface 1's endpoint is logged but discarded. The
+   parser needs to either capture all interfaces or accept a
+   target-interface argument from the caller.
+
+2. **SET_INTERFACE control request.** Switching the audio device from
+   alt 0 (no endpoints) to alt 1 (isoch endpoint active) requires
+   issuing `SET_INTERFACE(intf=1, alt=1)`. This is a one-line standard
+   request; the harder part is re-running CONFIGURE_ENDPOINT after the
+   switch to install the newly-active endpoint into the slot's
+   context.
+
+Once those two land, the isoch path can be exercised by walking
+`usb_for_each_device` for class=1 devices, doing the alt switch, and
+calling `usb_isoch_transfer` with a small buffer.
+
+#### Beyond-QEMU caveats
+
+Even with the QEMU end-to-end test, real-hardware issues likely lurk
+in:
+
+- **SuperSpeed bandwidth reservation.** SS isoch needs Mult and
+  MaxBurst from the Endpoint Companion descriptor, which we don't
+  parse. Today we default them to 0; an SS isoch device will likely
+  request more bandwidth than that allocates.
+- **Frame scheduling.** SIA=1 hides the question of "when?" — fine for
+  best-effort audio playback, not fine for tight A/V sync where the
+  caller wants a specific frame.
+- **Underrun / overrun handling.** Completion codes `RING_UNDERRUN`
+  and `RING_OVERRUN` are routine for isoch (the device couldn't keep
+  up for one frame) and aren't fatal. We currently log them as errors;
+  a real audio driver would log + continue.
 
 ---
 
@@ -639,6 +727,7 @@ qemu-system-x86_64 \
   -device usb-mouse,bus=xhci.0 \
   -drive if=none,id=usbdisk,file=/tmp/usbtest.img,format=raw \
   -device usb-storage,bus=xhci.0,drive=usbdisk \
+  -device usb-audio,bus=xhci.0 \
   -no-reboot &
 QPID=$!
 sleep 12

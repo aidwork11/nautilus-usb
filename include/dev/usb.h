@@ -214,6 +214,13 @@ int usb_bulk_transfer(struct usb_device *dev, uint8_t ep,
 int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
                            void *data, size_t length, int dir);
 
+// Issue a USB isochronous transfer on the given endpoint. dir is
+// USB_DIR_IN or USB_DIR_OUT. Real-time semantics: no retries, drops
+// on missed service interval. Implemented but not yet exercised by
+// any class driver.
+int usb_isoch_transfer(struct usb_device *dev, uint8_t ep,
+                       void *data, size_t length, int dir);
+
 // Look up a parsed endpoint by (ep_num, dir_in). Returns NULL if no
 // such endpoint exists on the device's active interface.
 struct usb_endpoint *usb_find_endpoint(struct usb_device *dev,

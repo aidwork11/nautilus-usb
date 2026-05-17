@@ -971,17 +971,33 @@ static void xhci_init_ep_ctx(struct xhci_ep_ctx *ep, struct xhci_ring *ring, con
         }
     }
 
+    // CErr is bits 2:1 of DW1, 2 bits wide. xHCI spec mandates CErr=0
+    // for isoch endpoints (no retries — isoch never retries on the
+    // wire). Other EP types use the conventional CErr=3 (retry count).
+    uint32_t cerr = (xfer == USB_EP_XFER_ISOCH) ? 0u : 3u;
+
+    // Max ESIT Payload = bytes the controller may transfer per Endpoint
+    // Service Interval Time. Required for periodic endpoints (isoch +
+    // intr). We don't track Mult / MaxBurst (those come from SuperSpeed
+    // Endpoint Companion descriptors we don't parse yet), so the simple
+    // form max_esit = max_pkt holds for FS/HS single-burst endpoints.
+    // Bulk/control leave it at 0.
+    uint32_t max_esit = 0;
+    if (xfer == USB_EP_XFER_ISOCH || xfer == USB_EP_XFER_INTR) {
+        max_esit = max_pkt;
+    }
+
     // populating the dwords - EP type, cerr, max pkt, dequeue pointer, cycle state, avg packet size
     memset(ep, 0, sizeof(*ep));
     ep->fields[0] = ((uint32_t)interval << 16);
     ep->fields[1] =
         ((uint32_t)ep_type << XHCI_EP_DW1_EP_TYPE_SHIFT) |
-        (3u                << XHCI_EP_DW1_CERR_SHIFT) |
+        (cerr              << XHCI_EP_DW1_CERR_SHIFT) |
         ((uint32_t)max_pkt << XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT);
     uint64_t deq = ring->trbs_phys | XHCI_EP_DCS;
     ep->fields[2] = (uint32_t)(deq & 0xffffffffu);
     ep->fields[3] = (uint32_t)(deq >> 32);
-    ep->fields[4] = max_pkt;   // Average TRB Length = max packet size
+    ep->fields[4] = max_pkt | (max_esit << XHCI_EP_DW4_MAX_ESIT_PAY_SHIFT);
 }
 
 // Issue CONFIGURE_ENDPOINT for all endpoints on the device's active
@@ -1098,6 +1114,78 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
     if (wait.completion_code != XHCI_CC_SUCCESS &&
         wait.completion_code != XHCI_CC_SHORT_PACKET) {
         ERROR("normal xfer slot=%d dci=%d: cc=%u\n",
+              slot_id, dci, wait.completion_code);
+        return -1;
+    }
+    return (int)length - (int)wait.residual_len;
+}
+
+// Issue one ISOCH TRB on a endpoint's transfer ring and wait for its
+// TRANSFER_EVENT. Same shape as xhci_normal_transfer except:
+//   - TRB type is ISOCH (5), not NORMAL (1)
+//   - SIA=1 ("Start Isoch ASAP") so the controller schedules at the
+//     next available microframe; we don't pin a specific frame_id.
+//   - No retries on the wire — the EP context's CErr was set to 0 in
+//     xhci_init_ep_ctx, and isoch's whole point is dropping packets
+//     rather than holding up the bus.
+//
+// IMPORTANT: this code path is *not* exercised by any class driver
+// today (no USB audio / webcam consumer in the tree). It's implemented
+// against the xHCI 1.2 + USB 2.0/3.0 specs but has not been validated
+// on real hardware or in QEMU's isoch device emulators. The first real
+// caller is likely to surface bugs around frame scheduling, ESIT
+// payload sizing for SuperSpeed, and CONFIGURE_ENDPOINT bandwidth
+// reservation under contention.
+int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci,
+                        void *buf, uint16_t length) {
+    if (dci < 2 || dci > 31) {
+        ERROR("isoch xfer: invalid DCI %d\n", dci);
+        return -1;
+    }
+    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
+    if (!r) {
+        ERROR("isoch xfer slot=%d dci=%d: endpoint not configured\n",
+              slot_id, dci);
+        return -1;
+    }
+
+    uint32_t status  = length;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_ISOCH) | XHCI_TRB_SIA | XHCI_TRB_IOC;
+
+    struct xhci_xfer_wait wait;
+    memset(&wait, 0, sizeof(wait));
+    INIT_LIST_HEAD(&wait.node);
+    wait.slot_id = (uint8_t)slot_id;
+    wait.ep_id   = (uint8_t)dci;
+
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+    xhci_ring_reserve(r, 1);
+    wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
+    list_add_tail(&wait.node, &hc->xfer_waiters);
+    xhci_wmb();
+    xhci_writel(&hc->db_base[slot_id], dci);
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    // Isoch is real-time. If a frame is missed the controller drops it
+    // rather than retrying — so a 1 s ceiling here is plenty.
+    int rc = xhci_wait_completion(hc, &wait.completed, 1000);
+
+    flags = spin_lock_irq_save(&hc->lock);
+    list_del_init(&wait.node);
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    if (rc < 0) {
+        ERROR("isoch xfer slot=%d dci=%d: timeout\n", slot_id, dci);
+        return -1;
+    }
+    // Isoch defines several "expected" non-success completion codes
+    // (RING_UNDERRUN, RING_OVERRUN, missed service interval) that
+    // aren't fatal — the controller is telling us "I couldn't keep up
+    // for that frame." A real audio driver would log + continue. For
+    // now we surface them as errors so anyone testing notices.
+    if (wait.completion_code != XHCI_CC_SUCCESS &&
+        wait.completion_code != XHCI_CC_SHORT_PACKET) {
+        ERROR("isoch xfer slot=%d dci=%d: cc=%u\n",
               slot_id, dci, wait.completion_code);
         return -1;
     }

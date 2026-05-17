@@ -242,6 +242,37 @@ int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
                                USB_EP_XFER_INTR, "intr");
 }
 
+// Isoch dispatches to xhci_isoch_transfer rather than xhci_normal_transfer
+// because the underlying TRB type is different (ISOCH vs NORMAL).
+// Validation shape mirrors usb_normal_transfer.
+int usb_isoch_transfer(struct usb_device *dev, uint8_t ep,
+                       void *data, size_t length, int dir) {
+    if (!dev || !dev->hc) {
+        ERROR("isoch xfer: NULL device or hc\n");
+        return -1;
+    }
+    if (length > 0xffff) {
+        ERROR("isoch xfer slot=%u ep=%u: len %lu exceeds single-TRB max\n",
+              dev->slot_id, ep, (unsigned long)length);
+        return -1;
+    }
+    int dir_in = (dir & USB_DIR_IN) != 0;
+    struct usb_endpoint *e = usb_find_endpoint(dev, ep, dir_in);
+    if (!e) {
+        ERROR("isoch xfer slot=%u ep=%u dir=%s: endpoint not found\n",
+              dev->slot_id, ep, dir_in ? "IN" : "OUT");
+        return -1;
+    }
+    if ((e->attributes & USB_EP_XFER_MASK) != USB_EP_XFER_ISOCH) {
+        ERROR("isoch xfer slot=%u ep=%u: wrong endpoint type (got %u, want %u)\n",
+              dev->slot_id, ep, e->attributes & USB_EP_XFER_MASK,
+              USB_EP_XFER_ISOCH);
+        return -1;
+    }
+    return xhci_isoch_transfer(dev->hc, dev->slot_id, e->dci,
+                               data, (uint16_t)length);
+}
+
 int usb_get_descriptor(struct usb_device *dev, uint8_t dt_type, uint8_t dt_index, void *buf, uint16_t length) {
     // Standard "device-to-host, standard, device" descriptor read.
     // wValue's high byte is the descriptor type, low byte is the index.
