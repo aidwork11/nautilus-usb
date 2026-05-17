@@ -15,18 +15,10 @@
 #define ERROR(fmt, args...)  ERROR_PRINT("usb_msc: " fmt, ##args)
 
 
-//
-// Bulk-Only Transport round trip
-//
-// Three wire phases:
-//   1. CBW (31 B) on bulk-OUT  - command + direction + length
-//   2. data (0..N B) on bulk-IN or bulk-OUT (optional, direction from CBW)
-//   3. CSW (13 B) on bulk-IN   - status + residue
-//
-// Returns 0 on success (CSW status == 0). Returns -1 on any transport error
-// or on CSW status != 0. On short data the residue is reported via the
-// optional out_residue argument.
-//
+
+// Three wire phases: CBW, data (0..N B) (optional), CSW
+// Returns 0 on success. On short data the residue is 
+// returned in the out_residue argument.
 static int usb_msc_bot(struct usb_msc_dev *msc,
                        const uint8_t *cdb, uint8_t cdb_len,
                        void *data, uint32_t data_len, int dir_in,
@@ -36,22 +28,18 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
         return -1;
     }
 
-    // CBW + CSW go through bulk transfers, which read from buffer pointers.
-    // Stack allocation is fine — the caller (probe or smoke test) is in
-    // thread context with a generous stack, and the buffer outlives the
-    // transfer because xhci_normal_transfer waits before returning.
+    // CBW + CSW go through bulk transfers, which read from buffer pointers
     struct usb_msc_cbw cbw;
     memset(&cbw, 0, sizeof(cbw));
     cbw.signature   = USB_MSC_CBW_SIGNATURE;
     cbw.tag         = ++msc->tag_seq;
     cbw.data_length = data_len;
     cbw.flags       = dir_in ? USB_MSC_CBW_FLAG_IN : 0;
-    cbw.lun         = 0;        // we only drive LUN 0 today
+    cbw.lun         = 0;
     cbw.cdb_length  = cdb_len;
     memcpy(cbw.cdb, cdb, cdb_len);
 
-    int n = usb_bulk_transfer(msc->udev, msc->ep_out, &cbw, sizeof(cbw),
-                              USB_DIR_OUT);
+    int n = usb_bulk_transfer(msc->udev, msc->ep_out, &cbw, sizeof(cbw), USB_DIR_OUT);
     if (n != (int)sizeof(cbw)) {
         ERROR("CBW write returned %d (expected %u)\n", n, (unsigned)sizeof(cbw));
         return -1;
@@ -73,8 +61,7 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
 
     struct usb_msc_csw csw;
     memset(&csw, 0, sizeof(csw));
-    n = usb_bulk_transfer(msc->udev, msc->ep_in, &csw, sizeof(csw),
-                          USB_DIR_IN);
+    n = usb_bulk_transfer(msc->udev, msc->ep_in, &csw, sizeof(csw), USB_DIR_IN);
     if (n != (int)sizeof(csw)) {
         ERROR("CSW read returned %d (expected %u)\n", n, (unsigned)sizeof(csw));
         return -1;
@@ -93,8 +80,6 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
     }
 
     if (out_residue) {
-        // Prefer the device's residue accounting, falling back to the
-        // bulk transfer's residue if the device reported 0.
         *out_residue = csw.data_residue ? csw.data_residue : residue;
     }
     return 0;
@@ -105,9 +90,8 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
 // SCSI command wrappers
 //
 
-int usb_msc_inquiry(struct usb_msc_dev *msc,
-                    struct scsi_inquiry_data *out) {
-    uint8_t cdb[6] = {
+int usb_msc_inquiry(struct usb_msc_dev *msc, struct scsi_inquiry_data *out) {
+    uint8_t cdb[6] = { // command description block
         SCSI_OP_INQUIRY,
         0,                          // EVPD=0 (standard inquiry)
         0,                          // page code
@@ -116,12 +100,10 @@ int usb_msc_inquiry(struct usb_msc_dev *msc,
         0,                          // control
     };
     memset(out, 0, sizeof(*out));
-    return usb_msc_bot(msc, cdb, sizeof(cdb), out, sizeof(*out),
-                       1 /* dir_in */, NULL);
+    return usb_msc_bot(msc, cdb, sizeof(cdb), out, sizeof(*out), 1, NULL); // return residue
 }
 
-int usb_msc_read_capacity(struct usb_msc_dev *msc,
-                          uint32_t *out_last_lba, uint32_t *out_block_size) {
+int usb_msc_read_capacity(struct usb_msc_dev *msc, uint32_t *out_last_lba, uint32_t *out_block_size) {
     uint8_t cdb[10] = {
         SCSI_OP_READ_CAPACITY_10,
         0, 0, 0, 0, 0,              // reserved + LBA (PMI=0 so LBA must be 0)
@@ -130,12 +112,11 @@ int usb_msc_read_capacity(struct usb_msc_dev *msc,
         0, 0,                       // reserved + control
     };
     uint8_t resp[8] = { 0 };
-    if (usb_msc_bot(msc, cdb, sizeof(cdb), resp, sizeof(resp),
-                    1 /* dir_in */, NULL) < 0) {
+    if (usb_msc_bot(msc, cdb, sizeof(cdb), resp, sizeof(resp), 1, NULL) < 0) {
         return -1;
     }
-    // Both fields are big-endian 32-bit.
-    if (out_last_lba) {
+  
+    if (out_last_lba) { // logical block address
         *out_last_lba = ((uint32_t)resp[0] << 24) | ((uint32_t)resp[1] << 16) |
                         ((uint32_t)resp[2] << 8)  |  (uint32_t)resp[3];
     }
@@ -146,30 +127,25 @@ int usb_msc_read_capacity(struct usb_msc_dev *msc,
     return 0;
 }
 
-int usb_msc_read10(struct usb_msc_dev *msc,
-                   uint32_t lba, uint16_t nblocks, void *buf) {
+// 10 here is metadata about the op
+int usb_msc_read10(struct usb_msc_dev *msc, uint32_t lba, uint16_t nblocks, void *buf) {
     if (nblocks == 0) return 0;
     uint32_t bsize = msc->block_size ? msc->block_size : 512;
     uint32_t want  = (uint32_t)nblocks * bsize;
     uint8_t cdb[10] = {
-        SCSI_OP_READ_10,
+        SCSI_OP_READ_10,                   // opcode
         0,                                 // flags (FUA=0, DPO=0)
-        (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+        (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), // lba
         (uint8_t)(lba >> 8),  (uint8_t)(lba & 0xff),
         0,                                 // group number
-        (uint8_t)(nblocks >> 8), (uint8_t)(nblocks & 0xff),
+        (uint8_t)(nblocks >> 8), (uint8_t)(nblocks & 0xff), // block count
         0,                                 // control
     };
-    return usb_msc_bot(msc, cdb, sizeof(cdb), buf, want,
-                       1 /* dir_in */, NULL);
+    return usb_msc_bot(msc, cdb, sizeof(cdb), buf, want, 1, NULL);
 }
 
 
-//
-// Get Max LUN — class-specific control request. Returns max LUN index
-// (so 0 means a single LUN). Some devices STALL this; treat that as
-// "single LUN" rather than failing the probe.
-//
+// Returns max LUN index (so 0 means a single LUN)
 static int usb_msc_get_max_lun(struct usb_msc_dev *msc, uint8_t *out_max_lun) {
     uint8_t resp = 0;
     int n = usb_control_transfer(msc->udev,
@@ -193,8 +169,7 @@ static int usb_msc_get_max_lun(struct usb_msc_dev *msc, uint8_t *out_max_lun) {
 
 
 //
-// Per-driver state. Static array because nothing in NK frees class
-// drivers, and the table is bounded by max_slots (= 64 today).
+// Per-driver state
 //
 
 #define USB_MSC_MAX_DEVS 8
@@ -212,10 +187,8 @@ static struct usb_msc_dev *usb_msc_alloc(void) {
 }
 
 
-// Copy a fixed-width, space-padded INQUIRY ASCII field into a
-// null-terminated buffer, trimming trailing spaces.
-static void copy_inq_field(char *dst, size_t dst_sz,
-                           const char *src, size_t src_len) {
+// Copy a INQUIRY ASCII field into a buffer
+static void copy_inq_field(char *dst, size_t dst_sz, const char *src, size_t src_len) {
     size_t n = src_len < dst_sz - 1 ? src_len : dst_sz - 1;
     memcpy(dst, src, n);
     dst[n] = 0;
@@ -240,9 +213,9 @@ static int usb_msc_probe(struct usb_device *udev) {
     struct usb_msc_dev *m = usb_msc_alloc();
     if (!m) return -1;
     m->udev  = udev;
-    m->iface = 0;       // single-interface parser; always interface 0
+    m->iface = 0;
 
-    // Walk the parsed endpoint list for one bulk-IN and one bulk-OUT.
+    // Walk the parsed endpoint list for one bulk-IN and one bulk-OUT
     for (uint32_t i = 0; i < udev->num_endpoints; i++) {
         struct usb_endpoint *e = &udev->endpoints[i];
         if (!e->active) continue;
@@ -287,36 +260,9 @@ static int usb_msc_probe(struct usb_device *udev) {
          udev->slot_id, m->num_blocks, m->block_size,
          (uint32_t)(((uint64_t)m->num_blocks * m->block_size) >> 20));
 
-    // Smoke test: read LBA 0 and log the first 16 bytes. Class drivers
-    // wouldn't normally I/O during probe — this is here so the test plan
-    // (T5) has an automatic check that the full path works end-to-end.
-    if (m->block_size > 0 && m->block_size <= 4096) {
-        uint8_t *buf = kmem_mallocz(m->block_size);
-        if (buf) {
-            if (usb_msc_read10(m, 0, 1, buf) == 0) {
-                INFO("slot %u: LBA 0 first 16 B: "
-                     "%02x %02x %02x %02x %02x %02x %02x %02x "
-                     "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                     udev->slot_id,
-                     buf[0],  buf[1],  buf[2],  buf[3],
-                     buf[4],  buf[5],  buf[6],  buf[7],
-                     buf[8],  buf[9],  buf[10], buf[11],
-                     buf[12], buf[13], buf[14], buf[15]);
-            } else {
-                ERROR("slot %u: READ(10) of LBA 0 failed\n", udev->slot_id);
-            }
-            kmem_free(buf);
-        }
-    }
-
     udev->driver_data = m;
     return 0;
 }
-
-
-//
-// usb_dump_devices counterpart for MSC. Iterates our static table.
-//
 
 void usb_msc_dump(void) {
     if (usb_msc_devs_n == 0) {
@@ -333,10 +279,7 @@ void usb_msc_dump(void) {
 }
 
 
-//
 // Registration
-//
-
 static const struct usb_driver usb_msc_driver = {
     .match_class    = USB_CLASS_MASS_STORAGE,
     .match_subclass = USB_MSC_SUBCLASS_SCSI,
