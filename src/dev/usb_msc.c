@@ -1,6 +1,8 @@
 #include <nautilus/nautilus.h>
 #include <nautilus/mm.h>
 #include <nautilus/naut_string.h>
+#include <nautilus/blkdev.h>
+#include <nautilus/semaphore.h>
 #include <dev/usb.h>
 #include <dev/usb_msc.h>
 #include <dev/xhci.h>     // XHCI_CC_STALL_ERROR (transfer fns return -cc on stall)
@@ -284,6 +286,10 @@ static void copy_inq_field(char *dst, size_t dst_sz, const char *src, size_t src
 }
 
 
+// Forward decls for the block-device shim defined below the probe.
+static int usb_msc_block_size_ok(uint32_t bsize);
+static int usb_msc_blk_register(struct usb_msc_dev *m);
+
 //
 // Probe
 //
@@ -346,7 +352,178 @@ static int usb_msc_probe(struct usb_device *udev) {
          udev->slot_id, m->num_blocks, m->block_size,
          (uint32_t)(((uint64_t)m->num_blocks * m->block_size) >> 20));
 
+    if (!usb_msc_block_size_ok(m->block_size)) {
+        ERROR("slot %u: refusing to register block device with "
+              "out-of-spec block size %u (expected 512/1024/2048/4096)\n",
+              udev->slot_id, m->block_size);
+        return -1;
+    }
+
     udev->driver_data = m;
+
+    // Publish via NK's block-device registry so filesystems can find this
+    // disk. Done after udev->driver_data is set so the disconnect callback
+    // can find `m` if registration races with an immediate unplug.
+    if (usb_msc_blk_register(m) < 0) {
+        udev->driver_data = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+//
+// Block-device integration
+//
+// One NK block device per bound USB MSC slot. NK callers (filesystem,
+// partitioner, etc.) come in through nk_block_dev_read/write; we serialize
+// at the BOT-command granularity with m->iolock so concurrent block
+// requests don't interleave CBW/data/CSW phases on the wire.
+//
+// Per BOT command the xHCI single-TRB transfer cap is 65535 bytes, so a
+// caller's block count gets split into chunks of `0xffff / block_size`
+// blocks. Each chunk is one (CBW, data, CSW) round-trip.
+//
+
+static int usb_msc_blk_get_characteristics(void *state,
+                                           struct nk_block_dev_characteristics *c) {
+    struct usb_msc_dev *m = (struct usb_msc_dev *)state;
+    if (!m || !m->udev) return -1;
+    c->block_size = m->block_size;
+    c->num_blocks = m->num_blocks;
+    return 0;
+}
+
+// Common body for read/write. dir_in distinguishes the two; buf is treated
+// as void* either way.
+static int usb_msc_blk_io(struct usb_msc_dev *m,
+                          uint64_t blocknum, uint64_t count,
+                          void *buf, int dir_in) {
+    if (!m || !m->udev) return -1;
+    if (count == 0) return 0;
+    uint32_t bsize = m->block_size;
+    if (bsize == 0 || bsize > 0xffff) {
+        ERROR("blk io: bad block size %u\n", bsize);
+        return -1;
+    }
+    // READ(10) / WRITE(10) carry a 32-bit LBA. Anything larger needs a
+    // 16-byte CDB which this driver doesn't implement; refuse cleanly so
+    // the caller sees an error instead of a silently-wrapped LBA.
+    if (blocknum + count > (uint64_t)0xffffffffu ||
+        blocknum + count > m->num_blocks) {
+        ERROR("blk io slot %u: range %lu+%lu out of bounds (num_blocks=%u)\n",
+              m->udev ? m->udev->slot_id : 0,
+              blocknum, count, m->num_blocks);
+        return -1;
+    }
+
+    uint32_t chunk_max = 0xffffu / bsize;   // blocks per BOT command
+    if (chunk_max == 0) chunk_max = 1;
+    if (chunk_max > 0xffffu) chunk_max = 0xffffu;
+
+    uint8_t *p = (uint8_t *)buf;
+    int rc = 0;
+
+    nk_semaphore_down(m->iolock);
+    while (count > 0) {
+        // Re-check liveness under the iolock so disconnect (which won't
+        // run while we hold it -- see usb_msc_disconnect) can't free us
+        // mid-loop.
+        if (!m->udev) {
+            rc = -1;
+            break;
+        }
+        uint16_t chunk = (count < chunk_max) ? (uint16_t)count : (uint16_t)chunk_max;
+        uint32_t residue = 0;
+        int op;
+        if (dir_in) {
+            op = usb_msc_read10(m, (uint32_t)blocknum, chunk, p, &residue);
+        } else {
+            op = usb_msc_write10(m, (uint32_t)blocknum, chunk, p, &residue);
+        }
+        if (op < 0) {
+            rc = -1;
+            break;
+        }
+        if (residue != 0) {
+            // Short BOT means the device transferred fewer bytes than asked
+            // -- for a block API that's a hard error; we don't have a way
+            // to surface partial-block success to the caller.
+            ERROR("blk %s slot %u: short transfer (lba=%lu chunk=%u residue=%u)\n",
+                  dir_in ? "read" : "write",
+                  m->udev->slot_id, blocknum, chunk, residue);
+            rc = -1;
+            break;
+        }
+        blocknum += chunk;
+        count    -= chunk;
+        p        += (size_t)chunk * bsize;
+    }
+    nk_semaphore_up(m->iolock);
+    return rc;
+}
+
+static int usb_msc_blk_read(void *state, uint64_t blocknum, uint64_t count,
+                            uint8_t *dest,
+                            void (*callback)(nk_block_dev_status_t, void *),
+                            void *context) {
+    struct usb_msc_dev *m = (struct usb_msc_dev *)state;
+    int rc = usb_msc_blk_io(m, blocknum, count, dest, /*dir_in=*/1);
+    if (callback) {
+        callback(rc == 0 ? NK_BLOCK_DEV_STATUS_SUCCESS
+                         : NK_BLOCK_DEV_STATUS_ERROR,
+                 context);
+    }
+    return rc;
+}
+
+static int usb_msc_blk_write(void *state, uint64_t blocknum, uint64_t count,
+                             uint8_t *src,
+                             void (*callback)(nk_block_dev_status_t, void *),
+                             void *context) {
+    struct usb_msc_dev *m = (struct usb_msc_dev *)state;
+    int rc = usb_msc_blk_io(m, blocknum, count, src, /*dir_in=*/0);
+    if (callback) {
+        callback(rc == 0 ? NK_BLOCK_DEV_STATUS_SUCCESS
+                         : NK_BLOCK_DEV_STATUS_ERROR,
+                 context);
+    }
+    return rc;
+}
+
+static struct nk_block_dev_int usb_msc_blk_int = {
+    .get_characteristics = usb_msc_blk_get_characteristics,
+    .read_blocks         = usb_msc_blk_read,
+    .write_blocks        = usb_msc_blk_write,
+};
+
+// Sanity-check block_size before publishing the block device. Devices
+// reporting nonsense (0 or wildly out-of-spec values) would otherwise
+// poison every arithmetic operation in the IO path.
+static int usb_msc_block_size_ok(uint32_t bsize) {
+    return bsize == 512 || bsize == 1024 || bsize == 2048 || bsize == 4096;
+}
+
+// Register an NK block device named "usb-mscN" where N is the slot's
+// index in usb_msc_devs[]. Names are stable across one boot but reused
+// after disconnect; that matches the rest of NK's device-name policy.
+static int usb_msc_blk_register(struct usb_msc_dev *m) {
+    uint32_t idx = (uint32_t)(m - usb_msc_devs);
+    snprintf(m->devname, sizeof(m->devname), "usb-msc%u", idx);
+
+    m->iolock = nk_semaphore_create(m->devname, 1, NK_SEMAPHORE_DEFAULT, NULL);
+    if (!m->iolock) {
+        ERROR("slot %u: cannot create iolock\n", m->udev->slot_id);
+        return -1;
+    }
+    m->blkdev = nk_block_dev_register(m->devname, 0, &usb_msc_blk_int, m);
+    if (!m->blkdev) {
+        ERROR("slot %u: nk_block_dev_register failed\n", m->udev->slot_id);
+        nk_semaphore_release(m->iolock);
+        m->iolock = NULL;
+        return -1;
+    }
+    INFO("slot %u: registered block device '%s' (%u x %u B)\n",
+         m->udev->slot_id, m->devname, m->num_blocks, m->block_size);
     return 0;
 }
 
@@ -370,10 +547,27 @@ void usb_msc_dump(void) {
 // reusable across plug/unplug cycles. After this returns, the framework
 // frees `udev`; any further class-driver access to this slot's `udev` would
 // be a use-after-free, so we NULL it out atomically with the slot release.
+//
+// Order: unregister the block device first so new NK callers can't enter
+// usb_msc_blk_io. Then take the iolock so any in-flight block IO drains
+// (xhci_disconnect_slot already force-completed its xfer waiter, so the
+// in-flight call returns -1 quickly and releases the semaphore). Then it's
+// safe to free the semaphore and zero the slot.
 static void usb_msc_disconnect(struct usb_device *udev) {
     struct usb_msc_dev *m = (struct usb_msc_dev *)udev->driver_data;
     if (!m) return;
-    INFO("slot %u: disconnect, releasing MSC slot\n", udev->slot_id);
+    INFO("slot %u: disconnect, releasing MSC slot '%s'\n",
+         udev->slot_id, m->devname);
+    if (m->blkdev) {
+        nk_block_dev_unregister(m->blkdev);
+        m->blkdev = NULL;
+    }
+    if (m->iolock) {
+        nk_semaphore_down(m->iolock);
+        nk_semaphore_up(m->iolock);
+        nk_semaphore_release(m->iolock);
+        m->iolock = NULL;
+    }
     memset(m, 0, sizeof(*m));
 }
 

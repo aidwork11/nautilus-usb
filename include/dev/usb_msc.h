@@ -4,6 +4,8 @@
 #include <nautilus/naut_types.h>
 
 struct usb_device;
+struct nk_block_dev;
+struct nk_semaphore;
 
 // USB Mass Storage class constants
 #define USB_CLASS_MASS_STORAGE      0x08
@@ -92,6 +94,16 @@ struct usb_msc_dev {
     char               vendor[9];       // null-terminated copies of INQUIRY fields
     char               product[17];
     char               revision[5];
+
+    // Block-device integration. blkdev is registered with the NK device
+    // registry once probe finishes; iolock serializes BOT phases (CBW/data/
+    // CSW are a single SCSI command and cannot interleave with another
+    // command's phases on the same device). devname is the registry name
+    // (e.g., "usb-msc0") -- stashed so disconnect can log it without
+    // touching the freed nk_block_dev.
+    struct nk_block_dev *blkdev;
+    struct nk_semaphore *iolock;
+    char                 devname[16];
 };
 
 //
