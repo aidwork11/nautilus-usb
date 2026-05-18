@@ -1065,6 +1065,104 @@ static int xhci_configure_endpoint(struct xhci_hc *hc, int slot_id,
     return 0;
 }
 
+// Re-issue CONFIGURE_ENDPOINT with explicit drop/add lists for a SET_INTERFACE switch.
+// Frees transfer rings for endpoints in drop_eps and allocates fresh rings for endpoints
+// in add_eps. The slot context's Context Entries field is recomputed to span the
+// highest-DCI retained or newly-added endpoint.
+int xhci_reconfigure_endpoints(struct xhci_hc *hc, int slot_id, uint8_t speed,
+                               struct usb_endpoint *drop_eps, uint32_t drop_n,
+                               struct usb_endpoint *add_eps,  uint32_t add_n) {
+    struct xhci_input_ctx *in = hc->input_ctxs[slot_id];
+    if (!in) {
+        ERROR("slot %d: reconfigure_endpoints without input context\n", slot_id);
+        return -1;
+    }
+
+    // Refresh slot state from the output context -- ADDRESS_DEVICE wrote the
+    // assigned USB address there and we don't want to clobber it.
+    in->device.slot = hc->device_ctxs[slot_id]->slot;
+
+    // Drop phase: free old rings, clear their EP contexts, set drop_flags.
+    uint32_t drop_flags = 0;
+    for (uint32_t i = 0; i < drop_n; i++) {
+        struct usb_endpoint *e = &drop_eps[i];
+        if (!e->active) continue;
+        int dir_in = USB_EP_DIR_IN(e->address);
+        int ep_num = USB_EP_NUM(e->address);
+        if (ep_num < 1 || ep_num > 15) continue;
+        uint8_t dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
+        drop_flags |= XHCI_INPUT_A_EP(dci);
+        struct xhci_ring *old = hc->ep_rings[slot_id * 32 + dci];
+        if (old) {
+            kmem_free(old->trbs);
+            kmem_free(old);
+            hc->ep_rings[slot_id * 32 + dci] = NULL;
+        }
+        memset(&in->device.ep[dci - 1], 0, sizeof(struct xhci_ep_ctx));
+    }
+
+    // Add phase: allocate fresh rings, fill EP contexts, set add_flags.
+    uint32_t add_flags = XHCI_INPUT_A0_SLOT;
+    uint8_t highest_dci = XHCI_EP0_ID;
+    for (uint32_t i = 0; i < add_n; i++) {
+        struct usb_endpoint *e = &add_eps[i];
+        if (!e->active) continue;
+        int dir_in = USB_EP_DIR_IN(e->address);
+        int ep_num = USB_EP_NUM(e->address);
+        if (ep_num < 1 || ep_num > 15) {
+            ERROR("slot %d: invalid ep_num %d\n", slot_id, ep_num);
+            return -1;
+        }
+        uint8_t dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
+        e->dci = dci;
+
+        // Defensive: if a ring still exists at this DCI (caller forgot to
+        // include it in drop_eps), free it before re-allocating.
+        if (hc->ep_rings[slot_id * 32 + dci]) {
+            kmem_free(hc->ep_rings[slot_id * 32 + dci]->trbs);
+            kmem_free(hc->ep_rings[slot_id * 32 + dci]);
+            hc->ep_rings[slot_id * 32 + dci] = NULL;
+        }
+        struct xhci_ring *ring = xhci_alloc_ep_ring(slot_id, dci);
+        if (!ring) return -1;
+        hc->ep_rings[slot_id * 32 + dci] = ring;
+
+        struct xhci_ep_ctx *ep_ctx = &in->device.ep[dci - 1];
+        xhci_init_ep_ctx(ep_ctx, ring, e, speed);
+
+        add_flags |= XHCI_INPUT_A_EP(dci);
+        if (dci > highest_dci) highest_dci = dci;
+    }
+
+    // Retained endpoints (currently configured, not dropped) must also be
+    // covered by the Context Entries field.
+    for (int dci = 2; dci <= 31; dci++) {
+        if (drop_flags & XHCI_INPUT_A_EP(dci)) continue;
+        if (hc->ep_rings[slot_id * 32 + dci] != NULL && dci > highest_dci) {
+            highest_dci = (uint8_t)dci;
+        }
+    }
+
+    in->device.slot.fields[0] =
+        (in->device.slot.fields[0] & ~XHCI_SLOT_DW0_CTX_ENTRIES_MASK) |
+        (((uint32_t)highest_dci << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT)
+            & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
+
+    in->ctrl.add_flags  = add_flags;
+    in->ctrl.drop_flags = drop_flags;
+
+    uint64_t param   = (uint64_t)in;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT)
+                     | XHCI_TRB_SLOT_ID(slot_id);
+
+    if (xhci_run_command(hc, param, 0, control, NULL, "CONFIGURE_ENDPOINT(reconf)") < 0) {
+        return -1;
+    }
+    INFO("slot %d: reconfigure complete (drop=0x%x add=0x%x, highest DCI=%u)\n",
+         slot_id, drop_flags, add_flags, highest_dci);
+    return 0;
+}
+
 // Issue one NORMAL TRB on a endpoint's transfer ring and wait for its TRANSFER_EVENT
 int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uint16_t length) {
     if (dci < 2 || dci > 31) {
@@ -1145,8 +1243,11 @@ int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uin
     xhci_writel(&hc->db_base[slot_id], dci);
     spin_unlock_irq_restore(&hc->lock, flags);
 
-    // If a frame is missed the controller drops it rather than retrying
-    int rc = xhci_wait_completion(hc, &wait.completed, 1000);
+    // If a frame is missed the controller drops it rather than retrying.
+    // QEMU's usb-audio schedules the first SIA transfer ~1 frame out (FS
+    // bInterval=1 = 1ms) but actual delivery can lag closer to ~1s, so we
+    // give isoch a generous timeout vs. the 1s used for bulk/control.
+    int rc = xhci_wait_completion(hc, &wait.completed, 2000);
 
     flags = spin_lock_irq_save(&hc->lock);
     list_del_init(&wait.node);
@@ -1308,22 +1409,19 @@ static int xhci_get_descriptor(struct xhci_hc *hc, int slot_id, uint8_t dt_type,
 
 // Walk a configuration descriptor blob and log each interface and endpoint.
 // Class-specific descriptors interleave; we skip them.
-// Walk a configuration descriptor blob. Logs each interface/endpoint
-// sub-descriptor and writes the FIRST interface's class triple back
-// through the out params (if non-NULL) for Phase 6.3 driver matching.
+// One usb_iface_alt record is emitted per (interface, alt setting) tuple.
+// Endpoints land in whichever record's interface descriptor most recently
+// preceded them, so composite devices and multi-alt interfaces (USB Audio,
+// HID with report descriptors split across alts, etc.) keep their endpoints
+// associated with the correct alt.
 static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len,
-                                         uint8_t *out_iface_class,
-                                         uint8_t *out_iface_subclass,
-                                         uint8_t *out_iface_protocol,
-                                         uint8_t *out_iface_num_eps,
-                                         struct usb_endpoint *out_eps,
-                                         uint32_t out_eps_cap,
-                                         uint32_t *out_eps_count) {
+                                         struct usb_iface_alt *out_alts,
+                                         uint32_t out_alts_cap,
+                                         uint32_t *out_alts_count) {
     static const char *xfer_names[] = { "control", "isoch", "bulk", "intr" };
     uint16_t off = 0;
-    int first_iface = 1;
-    int capturing_eps = 0;     // only capture endpoints belonging to the first interface
-    uint32_t n_eps = 0;
+    uint32_t n_alts = 0;
+    struct usb_iface_alt *cur = NULL;     // alt record taking subsequent endpoints
     while (off + 2 <= len) {
         uint8_t bLength         = buf[off];
         uint8_t bDescriptorType = buf[off + 1];
@@ -1343,16 +1441,19 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                  iface->bInterfaceNumber, iface->bAlternateSetting,
                  iface->bInterfaceClass, iface->bInterfaceSubClass,
                  iface->bInterfaceProtocol, iface->bNumEndpoints);
-            if (first_iface) {
-                if (out_iface_class)    *out_iface_class    = iface->bInterfaceClass;
-                if (out_iface_subclass) *out_iface_subclass = iface->bInterfaceSubClass;
-                if (out_iface_protocol) *out_iface_protocol = iface->bInterfaceProtocol;
-                if (out_iface_num_eps)  *out_iface_num_eps  = iface->bNumEndpoints;
-                first_iface = 0;
-                capturing_eps = 1;
-            } else {
-                // Endpoints from additional interfaces are logged but not captured
-                capturing_eps = 0;
+            cur = NULL;
+            if (out_alts && n_alts < out_alts_cap) {
+                cur = &out_alts[n_alts++];
+                memset(cur, 0, sizeof(*cur));
+                cur->intf            = iface->bInterfaceNumber;
+                cur->alt             = iface->bAlternateSetting;
+                cur->iface_class     = iface->bInterfaceClass;
+                cur->iface_subclass  = iface->bInterfaceSubClass;
+                cur->iface_protocol  = iface->bInterfaceProtocol;
+            } else if (out_alts) {
+                INFO("slot %d: alt table full at %u entries; dropping iface %u alt %u\n",
+                     slot_id, out_alts_cap,
+                     iface->bInterfaceNumber, iface->bAlternateSetting);
             }
             break;
         }
@@ -1363,13 +1464,17 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
                  slot_id,
                  USB_EP_NUM(ep->bEndpointAddress),
                  USB_EP_DIR_IN(ep->bEndpointAddress) ? "IN " : "OUT", xfer_names[xfer], ep->wMaxPacketSize, ep->bInterval);
-            if (capturing_eps && out_eps && n_eps < out_eps_cap) {
-                struct usb_endpoint *dst = &out_eps[n_eps++];
+            if (cur && cur->num_eps < USB_MAX_EPS_PER_IFACE_ALT) {
+                struct usb_endpoint *dst = &cur->eps[cur->num_eps++];
                 dst->address    = ep->bEndpointAddress;
                 dst->attributes = ep->bmAttributes;
                 dst->interval   = ep->bInterval;
                 dst->max_packet = ep->wMaxPacketSize & 0x7ff;
                 dst->active     = 1;
+            } else if (cur) {
+                INFO("slot %d: iface %u alt %u: ep cap (%u) reached, dropping ep%u\n",
+                     slot_id, cur->intf, cur->alt, USB_MAX_EPS_PER_IFACE_ALT,
+                     USB_EP_NUM(ep->bEndpointAddress));
             }
             break;
         }
@@ -1380,7 +1485,7 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
         }
         off += bLength;
     }
-    if (out_eps_count) *out_eps_count = n_eps;
+    if (out_alts_count) *out_alts_count = n_alts;
 }
 
 static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
@@ -1500,35 +1605,97 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
         kmem_free(dev_desc);
         return -1;
     }
-    // capture the first interface's class triple so usb_register_device can match drivers against it.
-    // capture the first interface's endpoint list so we can build EP contexts and allocate transfer rings for CONFIGURE_ENDPOINT.
-    uint8_t iface_class = 0, iface_sub = 0, iface_proto = 0, iface_n_eps = 0;
-    struct usb_endpoint scratch_eps[USB_MAX_EPS_PER_DEV];
-    memset(scratch_eps, 0, sizeof(scratch_eps));
-    uint32_t parsed_n_eps = 0;
+    // Parse the whole config descriptor into per-(intf, alt) records.
+    struct usb_iface_alt scratch_alts[USB_MAX_IFACE_ALTS];
+    memset(scratch_alts, 0, sizeof(scratch_alts));
+    uint32_t parsed_n_alts = 0;
     xhci_parse_config_descriptor(slot_id, cfg, total,
-                                 &iface_class, &iface_sub, &iface_proto, &iface_n_eps,
-                                 scratch_eps, USB_MAX_EPS_PER_DEV, &parsed_n_eps);
+                                 scratch_alts, USB_MAX_IFACE_ALTS, &parsed_n_alts);
     kmem_free(cfg);
 
-    // hand the parsed endpoints to CONFIGURE_ENDPOINT, then issue
-    // SET_CONFIGURATION so the device-side endpoint state also transitions
-    if (parsed_n_eps > 0) {
-        if (xhci_configure_endpoint(hc, slot_id, (uint8_t)speed, scratch_eps, parsed_n_eps) < 0) {
-            kmem_free(dev_desc);
-            return -1;
+    // DCI is a deterministic function of (ep_num, dir). Precompute it for
+    // every parsed endpoint so usb_set_interface() can build drop_flags
+    // straight from the per-alt records without redoing the math.
+    for (uint32_t a = 0; a < parsed_n_alts; a++) {
+        struct usb_iface_alt *alt = &scratch_alts[a];
+        for (uint32_t i = 0; i < alt->num_eps; i++) {
+            struct usb_endpoint *e = &alt->eps[i];
+            int ep_num = USB_EP_NUM(e->address);
+            int dir_in = USB_EP_DIR_IN(e->address);
+            e->dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
         }
-        if (xhci_control_transfer(hc, slot_id, USB_DIR_OUT, USB_REQ_SET_CONFIGURATION, config_val, 0, NULL, 0) < 0) {
-            ERROR("slot %d: SET_CONFIGURATION(%u) failed\n", slot_id, config_val);
-            kmem_free(dev_desc);
-            return -1;
-        }
-        uint8_t slot_state = (hc->device_ctxs[slot_id]->slot.fields[3] >> 27) & 0x1f;
-        INFO("slot %d: configured (config=%u, slot_state=%u, num_eps=%u)\n",
-             slot_id, config_val, slot_state, parsed_n_eps);
-    } else {
-        DEBUG("slot %d: no endpoints to configure (iface has only EP0)\n", slot_id);
     }
+
+    // Default-activate one alt per interface: prefer alt 0 (USB spec
+    // default), fall back to the first-seen alt if alt 0 isn't present.
+    for (uint32_t i = 0; i < parsed_n_alts; i++) {
+        struct usb_iface_alt *a = &scratch_alts[i];
+        if (a->alt == 0) {
+            a->active = 1;
+            continue;
+        }
+        int has_alt0 = 0;
+        for (uint32_t j = 0; j < parsed_n_alts; j++) {
+            if (scratch_alts[j].intf == a->intf && scratch_alts[j].alt == 0) {
+                has_alt0 = 1;
+                break;
+            }
+        }
+        if (!has_alt0) {
+            int first = 1;
+            for (uint32_t j = 0; j < i; j++) {
+                if (scratch_alts[j].intf == a->intf) {
+                    first = 0;
+                    break;
+                }
+            }
+            if (first) a->active = 1;
+        }
+    }
+
+    // Union the active alts' endpoints into a flat list — this is what
+    // class drivers (and usb_find_endpoint) walk.
+    struct usb_endpoint active_eps[USB_MAX_EPS_PER_DEV];
+    memset(active_eps, 0, sizeof(active_eps));
+    uint32_t active_n = 0;
+    for (uint32_t i = 0; i < parsed_n_alts; i++) {
+        if (!scratch_alts[i].active) continue;
+        for (uint32_t j = 0; j < scratch_alts[i].num_eps; j++) {
+            if (active_n < USB_MAX_EPS_PER_DEV) {
+                active_eps[active_n++] = scratch_alts[i].eps[j];
+            }
+        }
+    }
+
+    // Pull the legacy "first interface" class triple from interfaces[0]
+    // so usb_register_device can match drivers against it.
+    uint8_t iface_class = 0, iface_sub = 0, iface_proto = 0, iface_n_eps = 0;
+    if (parsed_n_alts > 0) {
+        iface_class = scratch_alts[0].iface_class;
+        iface_sub   = scratch_alts[0].iface_subclass;
+        iface_proto = scratch_alts[0].iface_protocol;
+        iface_n_eps = scratch_alts[0].num_eps;
+    }
+
+    // Always issue CONFIGURE_ENDPOINT + SET_CONFIGURATION so the slot
+    // transitions to Configured even when the default alts have zero
+    // endpoints (e.g. USB Audio: intf 1 alt 0 has no eps, alt 1 has the
+    // isoch ep). Without SET_CONFIGURATION the device sits in Address
+    // state and refuses subsequent SET_INTERFACE requests.
+    if (xhci_configure_endpoint(hc, slot_id, (uint8_t)speed,
+                                active_n > 0 ? active_eps : NULL, active_n) < 0) {
+        kmem_free(dev_desc);
+        return -1;
+    }
+    if (xhci_control_transfer(hc, slot_id, USB_DIR_OUT, USB_REQ_SET_CONFIGURATION,
+                              config_val, 0, NULL, 0) < 0) {
+        ERROR("slot %d: SET_CONFIGURATION(%u) failed\n", slot_id, config_val);
+        kmem_free(dev_desc);
+        return -1;
+    }
+    uint8_t slot_state = (hc->device_ctxs[slot_id]->slot.fields[3] >> 27) & 0x1f;
+    INFO("slot %d: configured (config=%u, slot_state=%u, active_eps=%u, alts=%u)\n",
+         slot_id, config_val, slot_state, active_n, parsed_n_alts);
 
     // build the usb_device handle and register it with the USB core
     struct usb_device *udev = usb_alloc_device();
@@ -1553,18 +1720,83 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     udev->iface_protocol = iface_proto;
     udev->iface_num_eps  = iface_n_eps;
     udev->num_configs    = dev_desc->bNumConfigurations;
-    udev->config_value   = (parsed_n_eps > 0) ? config_val : 0;
-    udev->num_endpoints  = parsed_n_eps;
-    memcpy(udev->endpoints, scratch_eps, sizeof(scratch_eps));
+    udev->config_value   = config_val;
+    udev->num_endpoints  = active_n;
+    memcpy(udev->endpoints, active_eps, sizeof(active_eps));
+    udev->num_iface_alts = (uint8_t)parsed_n_alts;
+    memcpy(udev->interfaces, scratch_alts, sizeof(scratch_alts));
     udev->hc             = hc;
     hc->usb_devices[slot_id] = udev;
     usb_register_device(udev);
 
     kmem_free(dev_desc);
 
-    INFO("port %u enumerated as slot %d (config=%u, eps=%u)\n",
-         port, slot_id, udev->config_value, udev->num_endpoints);
+    INFO("port %u enumerated as slot %d (config=%u, eps=%u, alts=%u)\n",
+         port, slot_id, udev->config_value, udev->num_endpoints, udev->num_iface_alts);
     return slot_id;
+}
+
+
+// Post-enumeration smoke test for the isoch transfer path.
+// QEMU's -device usb-audio enumerates as Audio Class 1.0 with intf 1
+// holding the streaming endpoints behind alt 1 (alt 0 is the spec's
+// zero-bandwidth default). We pick the first audio device, switch to
+// alt 1/1, find whatever isoch ep showed up, and issue one isoch TRB.
+// The log line ("isoch smoke test: ... OK" or "... failed") is what
+// the QEMU test harness greps for.
+static void xhci_isoch_smoke_test(struct xhci_hc *hc) {
+    for (int slot = 1; slot <= (int)hc->max_slots; slot++) {
+        struct usb_device *udev = hc->usb_devices[slot];
+        if (!udev) continue;
+        if (udev->iface_class != 1) continue;   // class 1 = audio
+
+        INFO("isoch smoke test: slot %d (iface_class=%u/%u) switching to alt 1/1\n",
+             slot, udev->iface_class, udev->iface_subclass);
+
+        if (usb_set_interface(udev, 1, 1) < 0) {
+            ERROR("isoch smoke test: slot %d SET_INTERFACE(1,1) failed\n", slot);
+            continue;
+        }
+
+        // Find the newly-active isoch endpoint
+        struct usb_endpoint *iso_ep = NULL;
+        for (uint32_t i = 0; i < udev->num_endpoints; i++) {
+            struct usb_endpoint *e = &udev->endpoints[i];
+            if (!e->active) continue;
+            if ((e->attributes & USB_EP_XFER_MASK) == USB_EP_XFER_ISOCH) {
+                iso_ep = e;
+                break;
+            }
+        }
+        if (!iso_ep) {
+            ERROR("isoch smoke test: slot %d no isoch ep after alt switch\n", slot);
+            continue;
+        }
+
+        uint8_t ep_num = USB_EP_NUM(iso_ep->address);
+        int dir_in    = USB_EP_DIR_IN(iso_ep->address);
+        size_t len    = iso_ep->max_packet;
+        if (len == 0)   len = 64;
+        if (len > 192)  len = 192;     // single QEMU usb-audio packet fits
+
+        void *buf = kmem_mallocz(len);
+        if (!buf) {
+            ERROR("isoch smoke test: slot %d cannot allocate %lu B buffer\n",
+                  slot, (unsigned long)len);
+            continue;
+        }
+
+        int rc = usb_isoch_transfer(udev, ep_num, buf, (uint16_t)len,
+                                    dir_in ? USB_DIR_IN : USB_DIR_OUT);
+        if (rc < 0) {
+            ERROR("isoch smoke test: slot %d ep%u %s transfer failed\n",
+                  slot, ep_num, dir_in ? "IN" : "OUT");
+        } else {
+            INFO("isoch smoke test: slot %d ep%u %s transfer OK (%d/%lu bytes)\n",
+                 slot, ep_num, dir_in ? "IN" : "OUT", rc, (unsigned long)len);
+        }
+        kmem_free(buf);
+    }
 }
 
 
@@ -1987,6 +2219,11 @@ static int xhci_init(struct xhci_hc *hc) {
     // CPU 0 before reaching here so the scheduler has 
     // someone to switch to when we sleep.
     xhci_scan_ports(hc);
+
+    // Phase-6.5 isoch end-to-end check against any USB Audio device that
+    // enumerated above. No-op if the QEMU smoke test isn't running with
+    // -device usb-audio attached.
+    xhci_isoch_smoke_test(hc);
 
     return 0;
 

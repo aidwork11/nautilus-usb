@@ -274,3 +274,77 @@ int usb_get_descriptor(struct usb_device *dev, uint8_t dt_type, uint8_t dt_index
     // wValue's high byte is the descriptor type, low byte is the index.
     return usb_control_transfer(dev, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR, (uint16_t)(dt_type << 8) | dt_index, 0, buf, length);
 }
+
+
+// Switch interface `intf` to alternate setting `alt`. Order: SET_INTERFACE
+// on the device side first (matches Linux), then xhci_reconfigure_endpoints
+// to bring the controller's slot context in sync.
+int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
+    if (!dev || !dev->hc) {
+        ERROR("set_interface: NULL device or hc\n");
+        return -1;
+    }
+
+    // Find the currently-active alt for this interface (may be NULL if
+    // this is the first call and the device's default alt 0 was never
+    // marked active -- defensive) and the requested new alt.
+    struct usb_iface_alt *old_alt = NULL;
+    struct usb_iface_alt *new_alt = NULL;
+    for (uint32_t i = 0; i < dev->num_iface_alts; i++) {
+        struct usb_iface_alt *a = &dev->interfaces[i];
+        if (a->intf != intf) continue;
+        if (a->active) old_alt = a;
+        if (a->alt == alt) new_alt = a;
+    }
+    if (!new_alt) {
+        ERROR("set_interface: slot %u: no alt %u on intf %u\n",
+              dev->slot_id, alt, intf);
+        return -1;
+    }
+    if (old_alt == new_alt) {
+        DEBUG("set_interface: slot %u: already on intf %u alt %u\n",
+              dev->slot_id, intf, alt);
+        return 0;
+    }
+
+    // 1. SET_INTERFACE control request: host-to-device, standard, interface recipient
+    int rc = usb_control_transfer(dev, 0x01, USB_REQ_SET_INTERFACE,
+                                  alt, intf, NULL, 0);
+    if (rc < 0) {
+        ERROR("set_interface: slot %u: SET_INTERFACE(intf=%u, alt=%u) failed\n",
+              dev->slot_id, intf, alt);
+        return -1;
+    }
+
+    // 2. Re-CONFIGURE_ENDPOINT on the controller side
+    struct usb_endpoint *drop_eps = old_alt ? old_alt->eps : NULL;
+    uint32_t drop_n               = old_alt ? old_alt->num_eps : 0;
+    if (xhci_reconfigure_endpoints(dev->hc, dev->slot_id, dev->speed,
+                                   drop_eps, drop_n,
+                                   new_alt->eps, new_alt->num_eps) < 0) {
+        ERROR("set_interface: slot %u: reconfigure failed -- "
+              "device on alt %u/%u but controller still has old rings\n",
+              dev->slot_id, intf, alt);
+        return -1;
+    }
+
+    // 3. Flip active flags and rebuild the active endpoint union
+    if (old_alt) old_alt->active = 0;
+    new_alt->active = 1;
+
+    memset(dev->endpoints, 0, sizeof(dev->endpoints));
+    dev->num_endpoints = 0;
+    for (uint32_t i = 0; i < dev->num_iface_alts; i++) {
+        struct usb_iface_alt *a = &dev->interfaces[i];
+        if (!a->active) continue;
+        for (uint32_t j = 0; j < a->num_eps; j++) {
+            if (dev->num_endpoints < USB_MAX_EPS_PER_DEV) {
+                dev->endpoints[dev->num_endpoints++] = a->eps[j];
+            }
+        }
+    }
+
+    INFO("slot %u: SET_INTERFACE intf=%u alt=%u (active eps=%u)\n",
+         dev->slot_id, intf, alt, dev->num_endpoints);
+    return 0;
+}

@@ -454,7 +454,7 @@ Note: 6.4 must also issue a `SET_CONFIGURATION` control transfer on the
 device before CONFIGURE_ENDPOINT, so the device-side endpoint state moves
 to active.
 
-### 6.5 Isochronous Transfers — **implemented; descriptor path validated, transfer path not yet**
+### 6.5 Isochronous Transfers — **implemented and validated end-to-end against QEMU usb-audio**
 
 Structurally distinct from bulk/interrupt: uses `XHCI_TRB_ISOCH` (not
 NORMAL), no retries, and needs different EP-context fields than
@@ -506,32 +506,46 @@ existing MSC and HID paths continue to pass with the audio device
 attached — no regression from the EP-context CErr / Max ESIT Payload
 changes.
 
-#### What's not yet validated
+#### End-to-end validation
 
-The actual `xhci_isoch_transfer` / `usb_isoch_transfer` call path is
-still untested end-to-end. The blocker is structural, not driver-side:
-USB Audio Class declares its isoch endpoint on **interface 1,
-alternate setting 1**, while interface 1 alternate setting 0 has zero
-endpoints (the spec's "zero-bandwidth default" pattern that lets
-plug-and-play coexist with audio playback). Two pieces of work are
-needed to reach the endpoint:
+The `xhci_isoch_transfer` / `usb_isoch_transfer` path now exercises
+all the way to the QEMU usb-audio device. The two structural
+prerequisites are in place:
 
-1. **Multi-interface endpoint capture.** Today
-   `xhci_parse_config_descriptor` only stores the first interface's
-   endpoints — interface 1's endpoint is logged but discarded. The
-   parser needs to either capture all interfaces or accept a
-   target-interface argument from the caller.
+1. **Multi-interface endpoint capture.** `xhci_parse_config_descriptor`
+   now emits one `struct usb_iface_alt` per (interface, alt) tuple
+   into `udev->interfaces[]`. The active set lands in
+   `udev->endpoints[]` as the union of every interface's currently-
+   selected alt. Default alt selection picks alt 0 of each interface
+   (USB spec default), falling back to first-seen if alt 0 is absent.
 
-2. **SET_INTERFACE control request.** Switching the audio device from
-   alt 0 (no endpoints) to alt 1 (isoch endpoint active) requires
-   issuing `SET_INTERFACE(intf=1, alt=1)`. This is a one-line standard
-   request; the harder part is re-running CONFIGURE_ENDPOINT after the
-   switch to install the newly-active endpoint into the slot's
-   context.
+2. **SET_INTERFACE + xhci_reconfigure_endpoints.**
+   `usb_set_interface(dev, intf, alt)` issues the SET_INTERFACE
+   control request and then `xhci_reconfigure_endpoints` (in
+   `src/dev/xhci.c`), which frees the dropped EPs' transfer rings,
+   allocates fresh rings for the added EPs, and issues a
+   drop+add CONFIGURE_ENDPOINT.
 
-Once those two land, the isoch path can be exercised by walking
-`usb_for_each_device` for class=1 devices, doing the alt switch, and
-calling `usb_isoch_transfer` with a small buffer.
+Initial enumeration now always issues CONFIGURE_ENDPOINT +
+SET_CONFIGURATION (previously gated on `parsed_n_eps > 0`), so devices
+whose default alts have zero endpoints — USB Audio is the canonical
+case — still transition from Address to Configured state. Without
+that, SET_INTERFACE would fail because the device-side rejects it
+outside Configured state.
+
+A smoke-test hook in `xhci_init` (`xhci_isoch_smoke_test`) walks the
+slots after enumeration, finds class=1 (audio) devices, calls
+`usb_set_interface(udev, 1, 1)`, and issues one `usb_isoch_transfer`
+against the now-active isoch ep. Current log line on success:
+
+```
+xhci: isoch smoke test: slot 3 ep1 OUT transfer OK (192/192 bytes)
+```
+
+QEMU's emulation delivers the SIA-scheduled transfer with ~900ms
+latency for the first packet on a backendless usb-audio device, so
+`xhci_isoch_transfer`'s timeout is set to 2s rather than the 1s used
+by bulk/control.
 
 #### Beyond-QEMU caveats
 

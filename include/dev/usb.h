@@ -22,6 +22,8 @@ struct xhci_hc;
 #define USB_REQ_SET_DESCRIPTOR     7
 #define USB_REQ_GET_CONFIGURATION  8
 #define USB_REQ_SET_CONFIGURATION  9
+#define USB_REQ_GET_INTERFACE      10
+#define USB_REQ_SET_INTERFACE      11
 
 // Descriptor types (high byte of wValue for GET_DESCRIPTOR)
 #define USB_DT_DEVICE              1
@@ -117,6 +119,28 @@ struct usb_endpoint {
 };
 
 //
+// Per-(interface, alt-setting) descriptor record.
+// Captured by the config-descriptor walker so SET_INTERFACE can find the
+// endpoints belonging to a non-default alt and so composite devices can
+// expose more than the first interface.
+//
+
+#define USB_MAX_IFACE_ALTS         8    // total alt records per device
+#define USB_MAX_EPS_PER_IFACE_ALT  4    // endpoints per alt record
+
+struct usb_iface_alt {
+    uint8_t  intf;              // bInterfaceNumber
+    uint8_t  alt;               // bAlternateSetting
+    uint8_t  iface_class;
+    uint8_t  iface_subclass;
+    uint8_t  iface_protocol;
+    uint8_t  num_eps;           // count populated in eps[]
+    uint8_t  active;            // 1 = this alt is currently selected for `intf`
+    uint8_t  rsvd;
+    struct usb_endpoint eps[USB_MAX_EPS_PER_IFACE_ALT];
+};
+
+//
 // USB device handle
 //
 
@@ -146,10 +170,16 @@ struct usb_device {
     // Active configuration value (after auto-activation during enumeration)
     uint8_t  config_value;
 
-    // Parsed endpoint table. Populated for the first interface only.
-    // Use usb_find_endpoint() to look up by (ep_num, dir_in).
+    // Active endpoint table — union of every interface's currently-selected
+    // alt setting. Rebuilt after SET_INTERFACE. usb_find_endpoint() walks
+    // this to look up by (ep_num, dir_in).
     struct usb_endpoint endpoints[USB_MAX_EPS_PER_DEV];
     uint8_t  num_endpoints;
+
+    // Per-(interface, alt) records parsed from the config descriptor.
+    // Includes every alt, active or not; switch alts with usb_set_interface().
+    struct usb_iface_alt interfaces[USB_MAX_IFACE_ALTS];
+    uint8_t  num_iface_alts;
 
     // Backing host controller
     struct xhci_hc *hc;
@@ -228,5 +258,11 @@ struct usb_endpoint *usb_find_endpoint(struct usb_device *dev,
 int usb_get_descriptor(struct usb_device *dev,
                        uint8_t dt_type, uint8_t dt_index,
                        void *buf, uint16_t length);
+
+// Switch interface `intf` to alternate setting `alt`. Issues the
+// SET_INTERFACE control request and re-runs CONFIGURE_ENDPOINT so the
+// xHC's slot context matches the new alt's endpoint set.
+// Returns 0 on success, -1 on failure or unknown alt.
+int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt);
 
 #endif // __USB_H__
