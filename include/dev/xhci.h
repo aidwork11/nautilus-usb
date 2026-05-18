@@ -557,32 +557,18 @@ int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci,
                         void *buf, uint16_t length);
 
 // Re-issue CONFIGURE_ENDPOINT with explicit drop/add endpoint lists.
-// Frees transfer rings for endpoints in drop_eps and allocates fresh
-// rings for endpoints in add_eps. Used by usb_set_interface() to bring
-// the controller's EP context in sync with a new alt setting.
+// Used for setting up a new alt
 int xhci_reconfigure_endpoints(struct xhci_hc *hc, int slot_id, uint8_t speed,
                                struct usb_endpoint *drop_eps, uint32_t drop_n,
                                struct usb_endpoint *add_eps,  uint32_t add_n);
 
-//
-// Compile-time size checks against the xHCI 1.2 spec. If any of these
-// fail, a struct lost its `__attribute__((packed))`, picked up a stray
-// field, or got a wrongly-sized member — the controller would then
-// read garbage at every offset. Cheaper to catch at build time.
-//
-_Static_assert(sizeof(struct xhci_trb)         == 16,
-               "xhci_trb must be 16 bytes");
-_Static_assert(sizeof(struct xhci_slot_ctx)    == 32,
-               "xhci_slot_ctx must be 32 bytes (32-byte context variant)");
-_Static_assert(sizeof(struct xhci_ep_ctx)      == 32,
-               "xhci_ep_ctx must be 32 bytes (32-byte context variant)");
-_Static_assert(sizeof(struct xhci_device_ctx)  == 1024,
-               "xhci_device_ctx must be 1024 bytes (32 + 31 * 32)");
-_Static_assert(sizeof(struct xhci_input_ctrl_ctx) == 32,
-               "xhci_input_ctrl_ctx must be 32 bytes");
-_Static_assert(sizeof(struct xhci_input_ctx)   == 1056,
-               "xhci_input_ctx must be 1056 bytes (32 + 1024)");
-_Static_assert(sizeof(struct xhci_erst_entry)  == 16,
-               "xhci_erst_entry must be 16 bytes");
+// Compile-time size checks 
+_Static_assert(sizeof(struct xhci_trb)            == 16, "xhci_trb must be 16 bytes");
+_Static_assert(sizeof(struct xhci_slot_ctx)       == 32, "xhci_slot_ctx must be 32 bytes (32-byte context variant)");
+_Static_assert(sizeof(struct xhci_ep_ctx)         == 32, "xhci_ep_ctx must be 32 bytes (32-byte context variant)");
+_Static_assert(sizeof(struct xhci_device_ctx)     == 1024, "xhci_device_ctx must be 1024 bytes (32 + 31 * 32)");
+_Static_assert(sizeof(struct xhci_input_ctrl_ctx) == 32, "xhci_input_ctrl_ctx must be 32 bytes");
+_Static_assert(sizeof(struct xhci_input_ctx)      == 1056, "xhci_input_ctx must be 1056 bytes (32 + 1024)");
+_Static_assert(sizeof(struct xhci_erst_entry)     == 16, "xhci_erst_entry must be 16 bytes");
 
 #endif // __XHCI_H__
