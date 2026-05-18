@@ -343,10 +343,7 @@ int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
 }
 
 
-// Three-step halt recovery:
-//   1. RESET_ENDPOINT (xHC: Halted -> Stopped)
-//   2. SET_TR_DEQUEUE_POINTER (xHC: resume past the stalled TRB)
-//   3. CLEAR_FEATURE(ENDPOINT_HALT) (device: leave halt state)
+// halt recovery
 int usb_clear_halt(struct usb_device *dev, uint8_t ep_num, int dir_in) {
     if (!dev || !dev->hc) {
         ERROR("clear_halt: NULL device or hc\n");
@@ -358,11 +355,12 @@ int usb_clear_halt(struct usb_device *dev, uint8_t ep_num, int dir_in) {
     }
     uint8_t dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
 
+    // reset the endpoint, set the tranfer ring dequeue pointer 
+    // xHC halted -> stopped; tell it to resume after the stalled endpoint
     if (xhci_reset_endpoint(dev->hc, dev->slot_id, dci) < 0) return -1;
     if (xhci_set_tr_dequeue_ptr(dev->hc, dev->slot_id, dci) < 0) return -1;
 
-    // CLEAR_FEATURE(ENDPOINT_HALT): host->device, standard, endpoint recipient
-    // wValue=0 (FEATURE_ENDPOINT_HALT), wIndex=ep address (dir bit | ep num)
+    // CLEAR_FEATURE(ENDPOINT_HALT) (tell device to leave halt state)
     uint16_t ep_addr = (uint16_t)ep_num | (dir_in ? USB_DIR_IN : 0);
     int rc = usb_control_transfer(dev, 0x02, USB_REQ_CLEAR_FEATURE,
                                   0, ep_addr, NULL, 0);

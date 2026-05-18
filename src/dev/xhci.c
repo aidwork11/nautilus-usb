@@ -1160,8 +1160,8 @@ int xhci_reconfigure_endpoints(struct xhci_hc *hc, int slot_id, uint8_t speed,
     return 0;
 }
 
-// RESET_ENDPOINT: moves the controller's EP state machine from Halted to
-// Stopped. Caller must follow with SET_TR_DEQUEUE_POINTER and a
+// moves the controller's EP state machine from Halted to
+// Stopped. must follow with SET_TR_DEQUEUE_POINTER and a
 // CLEAR_FEATURE(ENDPOINT_HALT) on the device before resuming transfers.
 int xhci_reset_endpoint(struct xhci_hc *hc, int slot_id, int dci) {
     if (dci < 1 || dci > 31) {
@@ -1181,7 +1181,7 @@ int xhci_reset_endpoint(struct xhci_hc *hc, int slot_id, int dci) {
 // SET_TR_DEQUEUE_POINTER: tells the controller where to resume fetching
 // TRBs after a halt. Resets the software ring to position 0 / cycle 1
 // so subsequent enqueues start fresh; points the controller at the same
-// place. Streams not used here (status field is zero).
+// place
 int xhci_set_tr_dequeue_ptr(struct xhci_hc *hc, int slot_id, int dci) {
     if (dci < 1 || dci > 31) {
         ERROR("set_tr_dequeue: invalid DCI %d\n", dci);
@@ -1260,7 +1260,6 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
         wait.completion_code != XHCI_CC_SHORT_PACKET) {
         ERROR("normal xfer slot=%d dci=%d: cc=%u\n",
               slot_id, dci, wait.completion_code);
-        // negative completion code so callers can detect STALL (-6) etc.
         return -(int)wait.completion_code;
     }
     return (int)length - (int)wait.residual_len;

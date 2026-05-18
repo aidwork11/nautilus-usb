@@ -17,10 +17,7 @@
 
 
 
-// BBB Reset Recovery (USB MSC BBB §5.3.4): class-specific RESET request
-// followed by CLEAR_FEATURE(ENDPOINT_HALT) on both bulk endpoints. Used
-// after a CSW_PHASE_ERROR or back-to-back STALLs to put the device back
-// into a known state.
+// Used to put the device back into a known state
 static int usb_msc_reset_recovery(struct usb_msc_dev *msc) {
     INFO("BBB Reset Recovery on slot %u (iface %u)\n",
          msc->udev->slot_id, msc->iface);
@@ -42,8 +39,6 @@ static int usb_msc_reset_recovery(struct usb_msc_dev *msc) {
 // Three wire phases: CBW, data (0..N B) (optional), CSW
 // Returns 0 on success. On short data the residue is
 // returned in the out_residue argument.
-// STALLs during the data or CSW phase are recovered with clear-halt
-// (per BBB §6.7.2/6.7.3); a CSW_PHASE_ERROR triggers Reset Recovery.
 static int usb_msc_bot(struct usb_msc_dev *msc,
                        const uint8_t *cdb, uint8_t cdb_len,
                        void *data, uint32_t data_len, int dir_in,
@@ -67,8 +62,6 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
     int n = usb_bulk_transfer(msc->udev, msc->ep_out, &cbw, sizeof(cbw), USB_DIR_OUT);
     if (n != (int)sizeof(cbw)) {
         ERROR("CBW write returned %d (expected %u)\n", n, (unsigned)sizeof(cbw));
-        // A stalled bulk-OUT before the device even has the CBW is a sign
-        // the device is wedged -- full BBB reset.
         if (n == -(int)XHCI_CC_STALL_ERROR) {
             usb_msc_reset_recovery(msc);
         }
@@ -83,10 +76,8 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
                                    dir_in ? USB_DIR_IN : USB_DIR_OUT);
         if (dn < 0) {
             if (dn == -(int)XHCI_CC_STALL_ERROR) {
-                // BBB §6.7.2/6.7.3: device may stall the data endpoint to
-                // signal command failure, but the CSW is still readable
-                // after a clear-halt. Don't return yet -- read the CSW so
-                // the caller learns the SCSI status.
+                // device may stall the data endpoint to
+                // signal command failure, read the CSW to learn the SCSI status.
                 ERROR("data stage stalled (dir=%s len=%u); clearing halt\n",
                       dir_in ? "IN" : "OUT", data_len);
                 usb_clear_halt(msc->udev,
@@ -134,7 +125,7 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
     }
     if (csw.status != USB_MSC_CSW_OK) {
         ERROR("CSW status=%u (cdb opcode 0x%02x)\n", csw.status, cbw.cdb[0]);
-        // Caller may follow up with usb_msc_request_sense() to learn why.
+        // could follow up with usb_msc_request_sense()
         return -1;
     }
 
@@ -149,8 +140,7 @@ static int usb_msc_bot(struct usb_msc_dev *msc,
 // SCSI command wrappers
 //
 
-// REQUEST_SENSE: 6-byte CDB asking for fixed-format sense data.
-// Standard SCSI follow-up after any non-OK CSW.
+// Standard SCSI follow-up after any non-OK CSW
 int usb_msc_request_sense(struct usb_msc_dev *msc, struct scsi_sense_data *out) {
     uint8_t cdb[6] = {
         SCSI_OP_REQUEST_SENSE,
@@ -218,7 +208,6 @@ int usb_msc_read10(struct usb_msc_dev *msc, uint32_t lba, uint16_t nblocks,
     return usb_msc_bot(msc, cdb, sizeof(cdb), buf, want, 1, out_residue);
 }
 
-// WRITE(10): mirror of READ(10) with bulk-OUT data phase.
 int usb_msc_write10(struct usb_msc_dev *msc, uint32_t lba, uint16_t nblocks,
                     const void *buf, uint32_t *out_residue) {
     if (nblocks == 0) return 0;
@@ -233,8 +222,7 @@ int usb_msc_write10(struct usb_msc_dev *msc, uint32_t lba, uint16_t nblocks,
         (uint8_t)(nblocks >> 8), (uint8_t)(nblocks & 0xff),
         0,                                 // control
     };
-    // usb_msc_bot takes `void *` for the data buffer but only writes when
-    // dir_in is set; here we're host->device so the cast strips const safely.
+   
     return usb_msc_bot(msc, cdb, sizeof(cdb), (void *)buf, want, 0, out_residue);
 }
 

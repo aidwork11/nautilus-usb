@@ -64,8 +64,8 @@ struct scsi_inquiry_data {
     char     revision[4];
 } __attribute__((packed));
 
-// Fixed-format sense data (SPC-3 §4.5.3). First 18 bytes are all most
-// drivers ever need — sense_key + asc + ascq describes WHY a command failed.
+// sense data is SCSI's way of telling a host why a device failed
+// CSW.status = failed, then send a REQUEST_SENSE Command
 struct scsi_sense_data {
     uint8_t  response_code;         // 0x70 (current) or 0x71 (deferred)
     uint8_t  reserved1;
@@ -106,6 +106,7 @@ int usb_msc_inquiry(struct usb_msc_dev *msc,
                     struct scsi_inquiry_data *out);
 int usb_msc_read_capacity(struct usb_msc_dev *msc,
                           uint32_t *out_last_lba, uint32_t *out_block_size);
+
 // READ(10) / WRITE(10). out_residue (optional, may be NULL) receives the
 // number of bytes the device did not transfer (0 on a full-length result).
 int usb_msc_read10(struct usb_msc_dev *msc,
@@ -115,7 +116,7 @@ int usb_msc_write10(struct usb_msc_dev *msc,
                     uint32_t lba, uint16_t nblocks,
                     const void *buf, uint32_t *out_residue);
 
-// REQUEST_SENSE: fetch fixed-format sense data after a failed command.
+// REQUEST_SENSE: fetch sense data after a failed command.
 int usb_msc_request_sense(struct usb_msc_dev *msc,
                           struct scsi_sense_data *out);
 
