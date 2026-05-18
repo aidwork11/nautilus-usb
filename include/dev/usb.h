@@ -49,6 +49,11 @@ struct xhci_hc;
 #define USB_SPEED_SS           4
 #define USB_SPEED_SSP          5
 
+// USB device classes (bDeviceClass). Most class drivers match on
+// interface class instead; hubs are the canonical exception since
+// they advertise their class at the device level.
+#define USB_CLASS_HUB          0x09
+
 //
 // USB descriptors
 //

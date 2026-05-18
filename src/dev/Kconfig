@@ -254,6 +254,23 @@ config DEBUG_USB_MSC
     help
       Turn on debug prints for the USB Mass Storage class driver
 
+config USB_HUB
+    bool "USB Hub class driver"
+    depends on XHCI
+    default y
+    help
+      USB 2.0 hub support. Recognizes class=9 devices, parses the hub
+      descriptor, marks the slot context as a hub on the xHC side, and
+      powers on the downstream ports. Enumerating devices behind the
+      hub is not yet implemented.
+
+config DEBUG_USB_HUB
+    bool "Debug USB Hub"
+    depends on DEBUG_PRINTS && USB_HUB
+    default n
+    help
+      Turn on debug prints for the USB Hub class driver
+
 
 config RAMDISK
     bool "RAM Disk Support"

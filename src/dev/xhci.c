@@ -14,6 +14,9 @@
 #ifdef NAUT_CONFIG_USB_MSC
 #include <dev/usb_msc.h>
 #endif
+#ifdef NAUT_CONFIG_USB_HUB
+#include <dev/usb_hub.h>
+#endif
 
 
 #ifndef NAUT_CONFIG_DEBUG_XHCI
@@ -1028,6 +1031,58 @@ static int xhci_evaluate_ep0_max_pkt(struct xhci_hc *hc, int slot_id,
     }
     INFO("slot %d: EVALUATE_CONTEXT updated EP0 max_pkt to %u\n",
          slot_id, new_max_pkt);
+    return 0;
+}
+
+// Mark a slot as a hub in the controller's view: sets the HUB bit, MTT
+// flag, downstream-port count, and TT think time. Required so the xHC
+// knows to apply Transaction Translator scheduling for any LS/FS devices
+// later enumerated behind this hub. Caller passes num_ports from the
+// parsed hub descriptor and ttt as the raw encoded value (0..3 = 8/16/
+// 24/32 FS bit times).
+int xhci_evaluate_hub_context(struct xhci_hc *hc, int slot_id,
+                              uint8_t num_ports, int mtt, uint8_t ttt) {
+    struct xhci_input_ctx *in = hc->input_ctxs[slot_id];
+    if (!in) {
+        ERROR("slot %d: hub eval without input context\n", slot_id);
+        return -1;
+    }
+
+    // Copy current slot context from output (the controller has been
+    // writing here since ADDRESS_DEVICE/CONFIGURE_ENDPOINT).
+    in->device.slot = hc->device_ctxs[slot_id]->slot;
+
+    // Set HUB (bit 26) and optionally MTT (bit 25) in DW0.
+    in->device.slot.fields[0] |= XHCI_SLOT_DW0_HUB;
+    if (mtt) {
+        in->device.slot.fields[0] |= XHCI_SLOT_DW0_MTT;
+    } else {
+        in->device.slot.fields[0] &= ~XHCI_SLOT_DW0_MTT;
+    }
+
+    // Number of downstream ports in DW1 bits 24-31.
+    in->device.slot.fields[1] =
+        (in->device.slot.fields[1] & ~XHCI_SLOT_DW1_NUM_PORTS_MASK) |
+        (((uint32_t)num_ports << XHCI_SLOT_DW1_NUM_PORTS_SHIFT)
+            & XHCI_SLOT_DW1_NUM_PORTS_MASK);
+
+    // TT Think Time in DW2 bits 16-17.
+    in->device.slot.fields[2] =
+        (in->device.slot.fields[2] & ~(0x3u << 16)) |
+        (((uint32_t)ttt & 0x3u) << 16);
+
+    in->ctrl.add_flags  = XHCI_INPUT_A0_SLOT;
+    in->ctrl.drop_flags = 0;
+
+    uint64_t param   = (uint64_t)in;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_EVALUATE_CONTEXT)
+                     | XHCI_TRB_SLOT_ID(slot_id);
+
+    if (xhci_run_command(hc, param, 0, control, NULL, "EVALUATE_CONTEXT(hub)") < 0) {
+        return -1;
+    }
+    INFO("slot %d: marked as hub (ports=%u, mtt=%d, ttt=%u)\n",
+         slot_id, num_ports, mtt, ttt);
     return 0;
 }
 
@@ -2426,6 +2481,9 @@ int xhci_pci_init(struct naut_info *naut) {
     // probe path walks the driver table inside usb_register_device,
     // so the driver must be in the table by then.
     usb_msc_register();
+#endif
+#ifdef NAUT_CONFIG_USB_HUB
+    usb_hub_register();
 #endif
 
     // pci_map_over_devices uses 0xffff as "match any" for both vendor and device

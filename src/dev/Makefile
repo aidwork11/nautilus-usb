@@ -23,6 +23,7 @@ obj-$(NAUT_CONFIG_MLX3_PCI) += mlx3_ib.o
 
 obj-$(NAUT_CONFIG_XHCI) += xhci.o usb.o
 obj-$(NAUT_CONFIG_USB_MSC) += usb_msc.o
+obj-$(NAUT_CONFIG_USB_HUB) += usb_hub.o
 
 obj-$(NAUT_CONFIG_RAMDISK) += ramdisk.o
 
