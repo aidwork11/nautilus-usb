@@ -1160,6 +1160,61 @@ int xhci_reconfigure_endpoints(struct xhci_hc *hc, int slot_id, uint8_t speed,
     return 0;
 }
 
+// RESET_ENDPOINT: moves the controller's EP state machine from Halted to
+// Stopped. Caller must follow with SET_TR_DEQUEUE_POINTER and a
+// CLEAR_FEATURE(ENDPOINT_HALT) on the device before resuming transfers.
+int xhci_reset_endpoint(struct xhci_hc *hc, int slot_id, int dci) {
+    if (dci < 1 || dci > 31) {
+        ERROR("reset_endpoint: invalid DCI %d\n", dci);
+        return -1;
+    }
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_RESET_ENDPOINT)
+                     | XHCI_TRB_SLOT_ID(slot_id)
+                     | (((uint32_t)dci & 0x1f) << 16);
+    if (xhci_run_command(hc, 0, 0, control, NULL, "RESET_ENDPOINT") < 0) {
+        return -1;
+    }
+    INFO("slot %d dci %d: RESET_ENDPOINT complete\n", slot_id, dci);
+    return 0;
+}
+
+// SET_TR_DEQUEUE_POINTER: tells the controller where to resume fetching
+// TRBs after a halt. Resets the software ring to position 0 / cycle 1
+// so subsequent enqueues start fresh; points the controller at the same
+// place. Streams not used here (status field is zero).
+int xhci_set_tr_dequeue_ptr(struct xhci_hc *hc, int slot_id, int dci) {
+    if (dci < 1 || dci > 31) {
+        ERROR("set_tr_dequeue: invalid DCI %d\n", dci);
+        return -1;
+    }
+    struct xhci_ring *r;
+    if (dci == XHCI_EP0_ID) {
+        r = &hc->ep0_rings[slot_id];
+    } else {
+        r = hc->ep_rings[slot_id * 32 + dci];
+    }
+    if (!r || !r->trbs) {
+        ERROR("set_tr_dequeue slot=%d dci=%d: no ring\n", slot_id, dci);
+        return -1;
+    }
+
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+    r->enq   = 0;
+    r->deq   = 0;
+    r->cycle = 1;
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    uint64_t param   = r->trbs_phys | XHCI_EP_DCS;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_SET_TR_DEQUEUE)
+                     | XHCI_TRB_SLOT_ID(slot_id)
+                     | (((uint32_t)dci & 0x1f) << 16);
+    if (xhci_run_command(hc, param, 0, control, NULL, "SET_TR_DEQUEUE") < 0) {
+        return -1;
+    }
+    INFO("slot %d dci %d: SET_TR_DEQUEUE_POINTER -> ring base\n", slot_id, dci);
+    return 0;
+}
+
 // Issue one NORMAL TRB on a endpoint's transfer ring and wait for its TRANSFER_EVENT
 int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uint16_t length) {
     if (dci < 2 || dci > 31) {
@@ -1205,7 +1260,8 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
         wait.completion_code != XHCI_CC_SHORT_PACKET) {
         ERROR("normal xfer slot=%d dci=%d: cc=%u\n",
               slot_id, dci, wait.completion_code);
-        return -1;
+        // negative completion code so callers can detect STALL (-6) etc.
+        return -(int)wait.completion_code;
     }
     return (int)length - (int)wait.residual_len;
 }
@@ -1250,12 +1306,12 @@ int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uin
         ERROR("isoch xfer slot=%d dci=%d: timeout\n", slot_id, dci);
         return -1;
     }
-    
+
     if (wait.completion_code != XHCI_CC_SUCCESS &&
         wait.completion_code != XHCI_CC_SHORT_PACKET) {
         DEBUG("isoch xfer slot=%d dci=%d: cc=%u\n",
               slot_id, dci, wait.completion_code);
-        return -1;
+        return -(int)wait.completion_code;
     }
     return (int)length - (int)wait.residual_len;
 }
@@ -1371,7 +1427,7 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType
         wait.completion_code != XHCI_CC_SHORT_PACKET) {
         ERROR("control xfer slot=%d: completion code %u\n",
               slot_id, wait.completion_code);
-        return -1;
+        return -(int)wait.completion_code;
     }
 
     // residual = bytes the controller did not transfer
@@ -2139,11 +2195,6 @@ static int xhci_init(struct xhci_hc *hc) {
     // CPU 0 before reaching here so the scheduler has 
     // someone to switch to when we sleep.
     xhci_scan_ports(hc);
-
-    // Phase-6.5 isoch end-to-end check against any USB Audio device that
-    // enumerated above. No-op if the QEMU smoke test isn't running with
-    // -device usb-audio attached.
-    xhci_isoch_smoke_test(hc);
 
     return 0;
 

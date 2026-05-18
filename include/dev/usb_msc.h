@@ -49,6 +49,7 @@ struct usb_msc_csw {
 #define SCSI_OP_INQUIRY             0x12
 #define SCSI_OP_READ_CAPACITY_10    0x25
 #define SCSI_OP_READ_10             0x28
+#define SCSI_OP_WRITE_10            0x2A
 
 // Standard INQUIRY data prefix (first 36 bytes are enough for ID strings).
 struct scsi_inquiry_data {
@@ -61,6 +62,21 @@ struct scsi_inquiry_data {
     char     vendor[8];
     char     product[16];
     char     revision[4];
+} __attribute__((packed));
+
+// Fixed-format sense data (SPC-3 §4.5.3). First 18 bytes are all most
+// drivers ever need — sense_key + asc + ascq describes WHY a command failed.
+struct scsi_sense_data {
+    uint8_t  response_code;         // 0x70 (current) or 0x71 (deferred)
+    uint8_t  reserved1;
+    uint8_t  sense_key;             // bits 3:0 — NOT_READY (2), MEDIUM_ERROR (3), etc.
+    uint8_t  info[4];
+    uint8_t  add_sense_length;
+    uint8_t  cmd_specific[4];
+    uint8_t  asc;                   // additional sense code
+    uint8_t  ascq;                  // additional sense code qualifier
+    uint8_t  fruc;                  // field replaceable unit code
+    uint8_t  sense_key_specific[3];
 } __attribute__((packed));
 
 // Per-device driver state. Bound to usb_device->driver_data after probe.
@@ -90,8 +106,18 @@ int usb_msc_inquiry(struct usb_msc_dev *msc,
                     struct scsi_inquiry_data *out);
 int usb_msc_read_capacity(struct usb_msc_dev *msc,
                           uint32_t *out_last_lba, uint32_t *out_block_size);
+// READ(10) / WRITE(10). out_residue (optional, may be NULL) receives the
+// number of bytes the device did not transfer (0 on a full-length result).
 int usb_msc_read10(struct usb_msc_dev *msc,
-                   uint32_t lba, uint16_t nblocks, void *buf);
+                   uint32_t lba, uint16_t nblocks,
+                   void *buf, uint32_t *out_residue);
+int usb_msc_write10(struct usb_msc_dev *msc,
+                    uint32_t lba, uint16_t nblocks,
+                    const void *buf, uint32_t *out_residue);
+
+// REQUEST_SENSE: fetch fixed-format sense data after a failed command.
+int usb_msc_request_sense(struct usb_msc_dev *msc,
+                          struct scsi_sense_data *out);
 
 // Dump all bound MSC devices
 void usb_msc_dump(void);
@@ -107,5 +133,7 @@ _Static_assert(sizeof(struct usb_msc_csw)       == 13,
                "usb_msc_csw must be 13 bytes on the wire");
 _Static_assert(sizeof(struct scsi_inquiry_data) == 36,
                "scsi_inquiry_data prefix must be 36 bytes");
+_Static_assert(sizeof(struct scsi_sense_data)   == 18,
+               "scsi_sense_data must be 18 bytes (fixed format)");
 
 #endif // __USB_MSC_H__

@@ -562,6 +562,10 @@ int xhci_reconfigure_endpoints(struct xhci_hc *hc, int slot_id, uint8_t speed,
                                struct usb_endpoint *drop_eps, uint32_t drop_n,
                                struct usb_endpoint *add_eps,  uint32_t add_n);
 
+// Halt-recovery primitives. Used by usb_clear_halt() to undo a STALL.
+int xhci_reset_endpoint(struct xhci_hc *hc, int slot_id, int dci);
+int xhci_set_tr_dequeue_ptr(struct xhci_hc *hc, int slot_id, int dci);
+
 // Compile-time size checks 
 _Static_assert(sizeof(struct xhci_trb)            == 16, "xhci_trb must be 16 bytes");
 _Static_assert(sizeof(struct xhci_slot_ctx)       == 32, "xhci_slot_ctx must be 32 bytes (32-byte context variant)");

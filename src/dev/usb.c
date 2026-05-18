@@ -341,3 +341,38 @@ int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
          dev->slot_id, intf, alt, dev->num_endpoints);
     return 0;
 }
+
+
+// Three-step halt recovery:
+//   1. RESET_ENDPOINT (xHC: Halted -> Stopped)
+//   2. SET_TR_DEQUEUE_POINTER (xHC: resume past the stalled TRB)
+//   3. CLEAR_FEATURE(ENDPOINT_HALT) (device: leave halt state)
+int usb_clear_halt(struct usb_device *dev, uint8_t ep_num, int dir_in) {
+    if (!dev || !dev->hc) {
+        ERROR("clear_halt: NULL device or hc\n");
+        return -1;
+    }
+    if (ep_num < 1 || ep_num > 15) {
+        ERROR("clear_halt: invalid ep_num %u\n", ep_num);
+        return -1;
+    }
+    uint8_t dci = (uint8_t)((ep_num * 2) + (dir_in ? 1 : 0));
+
+    if (xhci_reset_endpoint(dev->hc, dev->slot_id, dci) < 0) return -1;
+    if (xhci_set_tr_dequeue_ptr(dev->hc, dev->slot_id, dci) < 0) return -1;
+
+    // CLEAR_FEATURE(ENDPOINT_HALT): host->device, standard, endpoint recipient
+    // wValue=0 (FEATURE_ENDPOINT_HALT), wIndex=ep address (dir bit | ep num)
+    uint16_t ep_addr = (uint16_t)ep_num | (dir_in ? USB_DIR_IN : 0);
+    int rc = usb_control_transfer(dev, 0x02, USB_REQ_CLEAR_FEATURE,
+                                  0, ep_addr, NULL, 0);
+    if (rc < 0) {
+        ERROR("clear_halt slot %u ep%u %s: CLEAR_FEATURE failed (rc=%d)\n",
+              dev->slot_id, ep_num, dir_in ? "IN" : "OUT", rc);
+        return -1;
+    }
+
+    INFO("slot %u ep%u %s: halt cleared\n",
+         dev->slot_id, ep_num, dir_in ? "IN" : "OUT");
+    return 0;
+}

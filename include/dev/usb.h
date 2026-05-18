@@ -260,4 +260,9 @@ int usb_get_descriptor(struct usb_device *dev,
 // Returns 0 on success, -1 on failure or unknown alt
 int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt);
 
+// Recover a halted (stalled) endpoint: RESET_ENDPOINT +
+// SET_TR_DEQUEUE_POINTER on the controller, CLEAR_FEATURE(ENDPOINT_HALT)
+// on the device. Caller can resume transfers after this returns 0.
+int usb_clear_halt(struct usb_device *dev, uint8_t ep_num, int dir_in);
+
 #endif // __USB_H__
