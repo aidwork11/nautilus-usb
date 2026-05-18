@@ -580,6 +580,12 @@ int xhci_set_tr_dequeue_ptr(struct xhci_hc *hc, int slot_id, int dci);
 int xhci_evaluate_hub_context(struct xhci_hc *hc, int slot_id,
                               uint8_t num_ports, int mtt, uint8_t ttt);
 
+// Enumerate a device discovered on `hub_port` of `hub_dev`. Caller has
+// already verified PORT_CONNECTION and run PORT_RESET on the hub side.
+// `speed` is decoded from the hub port status (FS/LS/HS).
+int xhci_enumerate_hub_port(struct xhci_hc *hc, struct usb_device *hub_dev,
+                            uint8_t hub_port, uint32_t speed);
+
 // Compile-time size checks 
 _Static_assert(sizeof(struct xhci_trb)            == 16, "xhci_trb must be 16 bytes");
 _Static_assert(sizeof(struct xhci_slot_ctx)       == 32, "xhci_slot_ctx must be 32 bytes (32-byte context variant)");

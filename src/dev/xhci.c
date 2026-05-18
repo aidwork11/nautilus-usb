@@ -819,7 +819,10 @@ static int xhci_alloc_device_ctx(struct xhci_hc *hc, int slot_id) {
 //   - input control: add_flags = slot | EP0
 //   - slot context:  route=0, port, speed, ctx_entries=1
 //   - EP0 context:   ep_type=Control, max_pkt by speed, TR deq ptr, CErr=3
-static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id, uint32_t port, uint32_t speed) {
+static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
+                                uint32_t root_port, uint32_t speed,
+                                uint32_t route_string,
+                                int parent_hub_slot, int parent_port) {
     // input context = 1 input control ctx + 1 slot context + ep0 context + 30 other endpoint contexts
     size_t in_size = 33 * hc->context_size;
     struct xhci_input_ctx *in = kmem_mallocz(in_size);
@@ -865,11 +868,18 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id, uint32_t port, 
     in->ctrl.add_flags  = XHCI_INPUT_A0_SLOT | XHCI_INPUT_A_EP(XHCI_EP0_ID);
     in->ctrl.drop_flags = 0;
 
-    // Slot context
-    // route = 0 for now (TODO) as hubs arent supported
-    // lots of other to-dos here
-    in->device.slot.fields[0] = ((speed << XHCI_SLOT_DW0_SPEED_SHIFT) & XHCI_SLOT_DW0_SPEED_MASK) | ((1u << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT) & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
-    in->device.slot.fields[1] = ((port  << XHCI_SLOT_DW1_RH_PORT_SHIFT) & XHCI_SLOT_DW1_RH_PORT_MASK);
+    // Slot context. route_string encodes the path through hubs (one nibble
+    // per tier, bits 0-3 = tier-1 hub port, etc.); 0 for a root-port device.
+    // Parent hub fields (DW2 bits 0-15) are needed for LS/FS devices behind
+    // a HS hub so the xHC can apply TT scheduling to their packets.
+    in->device.slot.fields[0] =
+        (route_string & XHCI_SLOT_DW0_ROUTE_MASK) |
+        ((speed << XHCI_SLOT_DW0_SPEED_SHIFT) & XHCI_SLOT_DW0_SPEED_MASK) |
+        ((1u << XHCI_SLOT_DW0_CTX_ENTRIES_SHIFT) & XHCI_SLOT_DW0_CTX_ENTRIES_MASK);
+    in->device.slot.fields[1] = ((root_port << XHCI_SLOT_DW1_RH_PORT_SHIFT) & XHCI_SLOT_DW1_RH_PORT_MASK);
+    in->device.slot.fields[2] =
+        ((uint32_t)(parent_hub_slot & 0xff) << 0) |
+        ((uint32_t)(parent_port & 0xff) << 8);
 
     // EP0 context
     uint16_t max_pkt = xhci_default_ep0_pkt_size(speed);
@@ -1720,19 +1730,17 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
     if (out_alts_count) *out_alts_count = n_alts;
 }
 
-static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
-    uint32_t psc = xhci_port_read(hc, port);
-    uint32_t speed = (psc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
-    if (speed == 0) {
-        ERROR("port %u: speed=0 after reset, cannot enumerate\n", port);
-        return -1;
-    }
-
-    int slot_id = xhci_enable_slot(hc);
-    if (slot_id < 0) return -1;
-
+// Run the full enumeration sequence on an already-enabled slot. The
+// caller supplies the slot id from ENABLE_SLOT plus the route/parent
+// info that ends up in the slot context. route_string=0 and
+// parent_hub_slot=0 means "device on the root hub".
+static int xhci_enumerate_at_slot(struct xhci_hc *hc, int slot_id,
+                                  uint32_t root_port, uint32_t speed,
+                                  uint32_t route_string,
+                                  int parent_hub_slot, int parent_port) {
     if (xhci_alloc_device_ctx(hc, slot_id) < 0) return -1;
-    if (xhci_alloc_input_ctx(hc, slot_id, port, speed) < 0) return -1;
+    if (xhci_alloc_input_ctx(hc, slot_id, root_port, speed,
+                             route_string, parent_hub_slot, parent_port) < 0) return -1;
 
     // hand the input context to the controller
     if (xhci_address_device(hc, slot_id, 1) < 0) return -1;
@@ -1933,7 +1941,7 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     udev->slot_id        = (uint8_t)slot_id;
     udev->address        = usb_addr;
     udev->speed          = (uint8_t)speed;
-    udev->port           = (uint8_t)port;
+    udev->port           = (uint8_t)root_port;
     udev->vendor_id      = dev_desc->idVendor;
     udev->product_id     = dev_desc->idProduct;
     udev->bcd_usb        = dev_desc->bcdUSB;
@@ -1958,9 +1966,50 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
 
     kmem_free(dev_desc);
 
-    INFO("port %u enumerated as slot %d (config=%u, eps=%u, alts=%u)\n",
-         port, slot_id, udev->config_value, udev->num_endpoints, udev->num_iface_alts);
+    INFO("port %u enumerated as slot %d (config=%u, eps=%u, alts=%u, route=0x%05x)\n",
+         root_port, slot_id, udev->config_value, udev->num_endpoints,
+         udev->num_iface_alts, route_string);
     return slot_id;
+}
+
+// Root-hub port enumeration: read speed off PORTSC, ENABLE_SLOT, then run
+// the common body with route=0 and no parent hub.
+static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
+    uint32_t psc = xhci_port_read(hc, port);
+    uint32_t speed = (psc & XHCI_PORTSC_SPEED_MASK) >> XHCI_PORTSC_SPEED_SHIFT;
+    if (speed == 0) {
+        ERROR("port %u: speed=0 after reset, cannot enumerate\n", port);
+        return -1;
+    }
+    int slot_id = xhci_enable_slot(hc);
+    if (slot_id < 0) return -1;
+    return xhci_enumerate_at_slot(hc, slot_id, port, speed, 0, 0, 0);
+}
+
+// Enumerate a device discovered on `hub_port` of a hub at slot `hub_dev->slot_id`.
+// Caller has already issued PORT_RESET on the hub and confirmed the port speed.
+// Route string is the 4-bit hub_port (one-tier hubs only; chained hubs would
+// need to OR with the hub's own route_string shifted left).
+// For LS/FS devices behind a HS hub, parent-hub fields tell the xHC where to
+// apply Transaction Translator scheduling.
+int xhci_enumerate_hub_port(struct xhci_hc *hc, struct usb_device *hub_dev,
+                            uint8_t hub_port, uint32_t speed) {
+    if (!hub_dev) {
+        ERROR("enumerate_hub_port: NULL hub_dev\n");
+        return -1;
+    }
+    int slot_id = xhci_enable_slot(hc);
+    if (slot_id < 0) return -1;
+
+    uint32_t route_string = (uint32_t)(hub_port & 0xf);
+    int parent_hub_slot = 0;
+    int parent_port     = 0;
+    if (speed == USB_SPEED_LS || speed == USB_SPEED_FS) {
+        parent_hub_slot = hub_dev->slot_id;
+        parent_port     = hub_port;
+    }
+    return xhci_enumerate_at_slot(hc, slot_id, hub_dev->port, speed,
+                                  route_string, parent_hub_slot, parent_port);
 }
 
 //

@@ -34,6 +34,23 @@ struct usb_device;
 #define USB_PORT_FEAT_C_OVERCURRENT   19
 #define USB_PORT_FEAT_C_RESET         20
 
+// wPortStatus bits (low 16 of the GET_PORT_STATUS response)
+#define USB_PORT_STAT_CONNECTION     (1u << 0)
+#define USB_PORT_STAT_ENABLE         (1u << 1)
+#define USB_PORT_STAT_SUSPEND        (1u << 2)
+#define USB_PORT_STAT_OVERCURRENT    (1u << 3)
+#define USB_PORT_STAT_RESET          (1u << 4)
+#define USB_PORT_STAT_POWER          (1u << 8)
+#define USB_PORT_STAT_LOW_SPEED      (1u << 9)
+#define USB_PORT_STAT_HIGH_SPEED     (1u << 10)
+
+// wPortChange bits (high 16 of the GET_PORT_STATUS response, i.e. bits 16-31)
+#define USB_PORT_CHG_CONNECTION      (1u << 16)
+#define USB_PORT_CHG_ENABLE          (1u << 17)
+#define USB_PORT_CHG_SUSPEND         (1u << 18)
+#define USB_PORT_CHG_OVERCURRENT     (1u << 19)
+#define USB_PORT_CHG_RESET           (1u << 20)
+
 // USB 2.0 hub descriptor. Variable-length tail (DeviceRemovable + PortPwrCtrlMask
 // bitmaps) trails the 7-byte header; we only consume the fixed prefix.
 struct usb_hub_descriptor {
