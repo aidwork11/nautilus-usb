@@ -77,8 +77,7 @@ struct naut_info;
 #define XHCI_HCC1_MAX_PSA(x)   (((x) >> 12) & 0xf) // max primary stream
 #define XHCI_HCC1_XECP(x)      (((x) >> 16) & 0xffff) // ext-cap ptr (dwords)
 
-// xHCI Extended Capabilities (chained at HCCPARAMS1.xECP).
-// Each cap starts with a dword: bits 0-7 = ID, 8-15 = next ptr in dwords (0=end).
+// xHCI Extended Capabilities
 #define XHCI_EXT_CAP_ID_USB_LEGACY     1
 #define XHCI_USBLEGSUP_BIOS_SEM_OFF    2    // byte offset within cap, bit 0 = BIOS owned
 #define XHCI_USBLEGSUP_OS_SEM_OFF      3    // byte offset within cap, bit 0 = OS owned
