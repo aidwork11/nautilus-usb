@@ -112,6 +112,63 @@ static int xhci_poll_until(void *reg, uint32_t mask, uint32_t expected,
 
 
 //
+// BIOS handoff via xHCI Extended Capabilities chain.
+//
+// Many real-world controllers boot BIOS-owned: the BIOS holds an SMI-driven
+// emulation layer that translates legacy USB keyboard/mouse access into xHCI
+// transfers. Before the OS driver touches any operational register, it must
+// walk the extended-capability chain, find the USB Legacy Support cap (ID=1),
+// assert the OS-owned semaphore, and poll the BIOS-owned semaphore until the
+// BIOS releases the controller. QEMU's xHCI does not implement USBLEGSUP at
+// all, so this is a no-op in the smoke test -- but it's required on real HW.
+//
+static int xhci_bios_handoff(struct xhci_hc *hc) {
+    uint32_t xecp_dwords = XHCI_HCC1_XECP(hc->hcc_params1);
+    if (xecp_dwords == 0) {
+        DEBUG("no extended capabilities\n");
+        return 0;
+    }
+    uint8_t *cap = (uint8_t *)hc->cap_base + xecp_dwords * 4;
+
+    // Walk the chain. Bound the loop in case of bad hardware producing a cycle.
+    for (int hops = 0; hops < 64; hops++) {
+        uint32_t hdr  = xhci_readl(cap);
+        uint8_t  id   = hdr & 0xff;
+        uint8_t  next = (hdr >> 8) & 0xff;
+        DEBUG("xECP @%p: id=%u next=%u\n", cap, id, next);
+
+        if (id == XHCI_EXT_CAP_ID_USB_LEGACY) {
+            INFO("USB Legacy Support cap @%p; requesting OS ownership\n", cap);
+            // Set OS-owned semaphore (byte +3, bit 0). Use byte access so we
+            // don't race the BIOS on the BIOS-owned byte.
+            uint8_t os_sem = xhci_readb(cap + XHCI_USBLEGSUP_OS_SEM_OFF);
+            xhci_writeb(cap + XHCI_USBLEGSUP_OS_SEM_OFF, os_sem | 1);
+
+            // Poll BIOS-owned (byte +2, bit 0) until cleared.
+            // Spec says BIOS gets "a reasonable amount of time" — Linux uses 5s.
+            for (int ms = 0; ms < 5000; ms++) {
+                if ((xhci_readb(cap + XHCI_USBLEGSUP_BIOS_SEM_OFF) & 1) == 0) {
+                    INFO("BIOS handoff complete after %d ms\n", ms);
+                    return 0;
+                }
+                udelay(1000);
+            }
+            ERROR("BIOS handoff: timed out waiting for BIOS to release\n");
+            // Some firmwares never clear the bit; clear it ourselves and
+            // hope the BIOS isn't actively trying to use the controller.
+            xhci_writeb(cap + XHCI_USBLEGSUP_BIOS_SEM_OFF, 0);
+            return -1;
+        }
+
+        if (next == 0) break;
+        cap += next * 4;
+    }
+    DEBUG("no USB Legacy Support capability in xECP chain\n");
+    return 0;
+}
+
+
+//
 // Controller reset
 //
 //
@@ -311,6 +368,7 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
 static void xhci_drain_event_ring(struct xhci_hc *hc);
 static int  xhci_enumerate_port(struct xhci_hc *hc, uint32_t port);
 static void xhci_process_pending_enumerations(struct xhci_hc *hc);
+static void xhci_process_pending_disconnects(struct xhci_hc *hc);
 
 // All RW1C bits in PORTSC - Mask these off in any read/modify/write so we
 // don't clear them by accident.
@@ -419,6 +477,11 @@ static void xhci_handle_port_status_change(struct xhci_hc *hc, struct xhci_trb *
         } else {
             INFO("port %u: device disconnected\n", port);
             xhci_port_clear_changes(hc, port, XHCI_PORTSC_CSC);
+            // Queue for slot teardown. Actual DISABLE_SLOT + free runs in
+            // thread context (sleeps for cmd completion), not from this drain.
+            if (port < 64) {
+                hc->pending_port_disconnect |= (1ULL << port);
+            }
         }
     }
 
@@ -574,6 +637,7 @@ static void xhci_scan_ports(struct xhci_hc *hc) {
     // Each enumeration may trigger more events (command completions); a
     // final drain after picks them up.
     xhci_process_pending_enumerations(hc);
+    xhci_process_pending_disconnects(hc);
     xhci_drain_event_ring(hc);
 }
 
@@ -837,6 +901,88 @@ static void xhci_process_pending_enumerations(struct xhci_hc *hc) {
         uint32_t port = (uint32_t)bit;
         hc->pending_port_enum &= ~(1ULL << bit);
         xhci_enumerate_port(hc, port);
+    }
+}
+
+// Find the slot id (if any) currently bound to this root hub port.
+// Linear scan -- max_slots is small (<=255).
+static int xhci_slot_for_port(struct xhci_hc *hc, uint32_t port) {
+    for (int s = 1; s <= (int)hc->max_slots; s++) {
+        struct usb_device *u = hc->usb_devices[s];
+        if (u && u->port == port) return s;
+    }
+    return -1;
+}
+
+// Tear down everything we allocated for a slot when its device disconnects:
+//   1. DISABLE_SLOT cmd (controller marks slot Disabled, zeroes DCBAA[slot])
+//   2. Free per-EP transfer rings (DCI 2..31)
+//   3. Free EP0 ring TRBs
+//   4. Free device + input contexts
+//   5. Unregister and free the usb_device
+// Runs in thread context (xhci_run_command sleeps); never call from IRQ.
+static int xhci_disconnect_slot(struct xhci_hc *hc, int slot_id) {
+    if (slot_id < 1 || slot_id > (int)hc->max_slots) {
+        ERROR("disconnect_slot: invalid slot %d\n", slot_id);
+        return -1;
+    }
+    INFO("slot %d: tearing down (disconnect)\n", slot_id);
+
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_DISABLE_SLOT)
+                     | XHCI_TRB_SLOT_ID(slot_id);
+    if (xhci_run_command(hc, 0, 0, control, NULL, "DISABLE_SLOT") < 0) {
+        ERROR("slot %d: DISABLE_SLOT failed (continuing teardown)\n", slot_id);
+    }
+
+    for (int dci = 2; dci <= 31; dci++) {
+        struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
+        if (r) {
+            if (r->trbs) kmem_free(r->trbs);
+            kmem_free(r);
+            hc->ep_rings[slot_id * 32 + dci] = NULL;
+        }
+    }
+
+    if (hc->ep0_rings[slot_id].trbs) {
+        kmem_free(hc->ep0_rings[slot_id].trbs);
+        memset(&hc->ep0_rings[slot_id], 0, sizeof(hc->ep0_rings[slot_id]));
+    }
+
+    if (hc->device_ctxs[slot_id]) {
+        kmem_free(hc->device_ctxs[slot_id]);
+        hc->device_ctxs[slot_id] = NULL;
+    }
+    if (hc->input_ctxs[slot_id]) {
+        kmem_free(hc->input_ctxs[slot_id]);
+        hc->input_ctxs[slot_id] = NULL;
+    }
+
+    // DISABLE_SLOT zeroes DCBAA[slot] but be defensive in case the cmd failed.
+    if (hc->dcbaa) hc->dcbaa[slot_id] = 0;
+
+    struct usb_device *udev = hc->usb_devices[slot_id];
+    if (udev) {
+        usb_unregister_device(udev);
+        usb_free_device(udev);
+        hc->usb_devices[slot_id] = NULL;
+    }
+
+    INFO("slot %d: teardown complete\n", slot_id);
+    return 0;
+}
+
+static void xhci_process_pending_disconnects(struct xhci_hc *hc) {
+    while (hc->pending_port_disconnect) {
+        int bit = __builtin_ffsll((long long)hc->pending_port_disconnect) - 1;
+        if (bit < 0) break;
+        uint32_t port = (uint32_t)bit;
+        hc->pending_port_disconnect &= ~(1ULL << bit);
+        int slot = xhci_slot_for_port(hc, port);
+        if (slot > 0) {
+            xhci_disconnect_slot(hc, slot);
+        } else {
+            DEBUG("port %u disconnect: no slot bound, nothing to free\n", port);
+        }
     }
 }
 
@@ -2130,6 +2276,10 @@ static int xhci_init(struct xhci_hc *hc) {
          hc->max_intrs, hc->context_size);
     DEBUG("  HCSPARAMS1=0x%08x HCSPARAMS2=0x%08x HCCPARAMS1=0x%08x\n",
           hc->hcs_params1, hc->hcs_params2, hc->hcc_params1);
+
+    // Must happen before any operational-register access. On real hardware
+    // the controller may boot under BIOS legacy emulation; we own it after.
+    xhci_bios_handoff(hc);
 
     if (xhci_reset(hc) < 0) {
         return -1;
