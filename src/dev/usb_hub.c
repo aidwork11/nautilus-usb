@@ -228,6 +228,15 @@ static int usb_hub_probe(struct usb_device *udev) {
 }
 
 
+// Release the per-hub state malloc'd by usb_hub_probe. Without this the
+// usb_hub_dev leaks on every disconnect.
+static void usb_hub_disconnect(struct usb_device *udev) {
+    struct usb_hub_dev *h = (struct usb_hub_dev *)udev->driver_data;
+    if (!h) return;
+    INFO("slot %u: disconnect, freeing hub state\n", udev->slot_id);
+    free(h);
+}
+
 // Hubs advertise their class at the device level (bDeviceClass=9), not the
 // interface level. Match accordingly.
 static const struct usb_driver usb_hub_driver = {
@@ -236,6 +245,7 @@ static const struct usb_driver usb_hub_driver = {
     .match_protocol = USB_ANY_PROTOCOL,
     .name           = "usb-hub",
     .probe          = usb_hub_probe,
+    .disconnect     = usb_hub_disconnect,
 };
 
 int usb_hub_register(void) {

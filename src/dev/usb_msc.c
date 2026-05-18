@@ -256,16 +256,20 @@ static int usb_msc_get_max_lun(struct usb_msc_dev *msc, uint8_t *out_max_lun) {
 
 #define USB_MSC_MAX_DEVS 8
 static struct usb_msc_dev usb_msc_devs[USB_MSC_MAX_DEVS];
-static uint32_t           usb_msc_devs_n = 0;
 
+// Find an unused slot. A slot is unused iff its udev pointer is NULL; the
+// disconnect callback clears it so disconnected devices return their slot to
+// the pool. The old monotonic counter never released slots, so the table
+// would permanently fill after MAX_DEVS connect/disconnect cycles.
 static struct usb_msc_dev *usb_msc_alloc(void) {
-    if (usb_msc_devs_n >= USB_MSC_MAX_DEVS) {
-        ERROR("device table full\n");
-        return NULL;
+    for (uint32_t i = 0; i < USB_MSC_MAX_DEVS; i++) {
+        if (!usb_msc_devs[i].udev) {
+            memset(&usb_msc_devs[i], 0, sizeof(usb_msc_devs[i]));
+            return &usb_msc_devs[i];
+        }
     }
-    struct usb_msc_dev *m = &usb_msc_devs[usb_msc_devs_n++];
-    memset(m, 0, sizeof(*m));
-    return m;
+    ERROR("device table full\n");
+    return NULL;
 }
 
 
@@ -347,17 +351,30 @@ static int usb_msc_probe(struct usb_device *udev) {
 }
 
 void usb_msc_dump(void) {
-    if (usb_msc_devs_n == 0) {
-        INFO("no MSC devices bound\n");
-        return;
-    }
-    for (uint32_t i = 0; i < usb_msc_devs_n; i++) {
+    int any = 0;
+    for (uint32_t i = 0; i < USB_MSC_MAX_DEVS; i++) {
         struct usb_msc_dev *m = &usb_msc_devs[i];
         if (!m->udev) continue;
+        any = 1;
         INFO("  slot %u  '%s' '%s' '%s'  %u x %u B  ep%u/ep%u\n",
              m->udev->slot_id, m->vendor, m->product, m->revision,
              m->num_blocks, m->block_size, m->ep_in, m->ep_out);
     }
+    if (!any) {
+        INFO("no MSC devices bound\n");
+    }
+}
+
+// Release this MSC slot when the underlying usb_device is being torn down.
+// Returning the slot here is what makes the static usb_msc_devs[] pool
+// reusable across plug/unplug cycles. After this returns, the framework
+// frees `udev`; any further class-driver access to this slot's `udev` would
+// be a use-after-free, so we NULL it out atomically with the slot release.
+static void usb_msc_disconnect(struct usb_device *udev) {
+    struct usb_msc_dev *m = (struct usb_msc_dev *)udev->driver_data;
+    if (!m) return;
+    INFO("slot %u: disconnect, releasing MSC slot\n", udev->slot_id);
+    memset(m, 0, sizeof(*m));
 }
 
 
@@ -368,6 +385,7 @@ static const struct usb_driver usb_msc_driver = {
     .match_protocol = USB_MSC_PROTOCOL_BBB,
     .name           = "usb-msc",
     .probe          = usb_msc_probe,
+    .disconnect     = usb_msc_disconnect,
 };
 
 int usb_msc_register(void) {

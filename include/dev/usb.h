@@ -152,6 +152,12 @@ struct usb_device {
     uint8_t  speed;          // USB_SPEED_*
     uint8_t  port;           // root hub port number (1-based)
 
+    // Topology. tier=0 means "on a root-hub port"; each downstream hub adds 1.
+    // route is the xHCI route string: bits[(tier-1)*4 .. tier*4 - 1] hold the
+    // hub port that selects this device. Capped at tier 5 by the xHCI spec.
+    uint8_t  tier;
+    uint32_t route;
+
     // From device descriptor
     uint16_t vendor_id;
     uint16_t product_id;
@@ -209,6 +215,11 @@ struct usb_driver {
     uint8_t      match_protocol;
     const char  *name;
     int        (*probe)(struct usb_device *dev);
+    // Optional. Called from usb_unregister_device before the usb_device is
+    // freed; the driver must drop any reference to dev (it becomes invalid
+    // immediately after this returns). Must not sleep on long operations
+    // and must not call back into the controller for transfers on dev.
+    void       (*disconnect)(struct usb_device *dev);
 };
 
 int usb_driver_register(const struct usb_driver *drv);

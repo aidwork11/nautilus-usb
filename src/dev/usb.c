@@ -123,6 +123,17 @@ int usb_register_device(struct usb_device *dev) {
 
 void usb_unregister_device(struct usb_device *dev) {
     if (!dev) return;
+    // Give the bound class driver a chance to drop its reference and free
+    // per-device state. After this returns, no class driver is allowed to
+    // touch `dev` anymore. Detach `dev->hc` so any racing usb_*_transfer call
+    // that already loaded dev fails the !dev->hc check instead of crashing.
+    const struct usb_driver *drv = dev->driver;
+    if (drv && drv->disconnect) {
+        drv->disconnect(dev);
+    }
+    dev->driver = NULL;
+    dev->driver_data = NULL;
+    dev->hc = NULL;
     if (!list_empty(&dev->node)) {
         list_del_init(&dev->node);
     }

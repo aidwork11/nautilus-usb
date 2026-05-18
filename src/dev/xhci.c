@@ -545,6 +545,10 @@ static int xhci_drain_locked(struct xhci_hc *hc) {
         switch (type) {
         case XHCI_TRB_PORT_STATUS_CHANGE: // plug or unplug event
             xhci_handle_port_status_change(hc, trb);
+            // Wake the port worker so it picks up the pending bit and runs
+            // enumeration / disconnect outside this drain (which may be in
+            // IRQ context and so cannot itself sleep on command completions).
+            woke = 1;
             break;
         case XHCI_TRB_COMMAND_COMPLETION: { // a command we put on the command ring has finished
             uint8_t cc  = XHCI_TRB_GET_COMP(trb->status);
@@ -900,14 +904,22 @@ static int xhci_alloc_input_ctx(struct xhci_hc *hc, int slot_id,
     return 0;
 }
 
-// enumerate ports one at a time
+// enumerate ports one at a time. The bitmap is set under hc->lock by the
+// IRQ-side drain, so snapshot+clear must also be under hc->lock to avoid
+// losing concurrent updates. xhci_enumerate_port itself sleeps on command
+// completions, so it must run with the lock dropped.
 static void xhci_process_pending_enumerations(struct xhci_hc *hc) {
-    while (hc->pending_port_enum) {
-        int bit = __builtin_ffsll((long long)hc->pending_port_enum) - 1;
-        if (bit < 0) break;
-        uint32_t port = (uint32_t)bit;
+    while (1) {
+        uint8_t flags = spin_lock_irq_save(&hc->lock);
+        uint64_t pending = hc->pending_port_enum;
+        if (!pending) {
+            spin_unlock_irq_restore(&hc->lock, flags);
+            return;
+        }
+        int bit = __builtin_ffsll((long long)pending) - 1;
         hc->pending_port_enum &= ~(1ULL << bit);
-        xhci_enumerate_port(hc, port);
+        spin_unlock_irq_restore(&hc->lock, flags);
+        xhci_enumerate_port(hc, (uint32_t)bit);
     }
 }
 
@@ -920,7 +932,25 @@ static int xhci_slot_for_port(struct xhci_hc *hc, uint32_t port) {
     return -1;
 }
 
-// Tear down everything we allocated for a slot when its device disconnects
+// Tear down everything we allocated for a slot when its device disconnects.
+//
+// Ordering matters: an unrelated thread may be mid-xhci_*_transfer() on this
+// slot when we run. We close that race in three phases, with hc->lock held
+// only across the bookkeeping phase:
+//
+//   1. Under hc->lock: snapshot the ring pointers, NULL the per-slot table
+//      entries (so any transfer that loads them under the same lock from now
+//      on bails), and force-complete any in-flight xfer waiters for this
+//      slot with USB_TRANSACTION_ERROR. We also unlink each force-completed
+//      waiter so a stray HW event for the now-dead slot doesn't match a
+//      waiter we just woke. Wake the waitq once outside the lock so sleeping
+//      transfer threads observe completion and unwind.
+//   2. Issue DISABLE_SLOT so the controller stops DMAing into the rings.
+//      This sleeps, so it runs with the lock released.
+//   3. Free the snapshotted memory. By this point no CPU thread can have
+//      reached the rings (phase 1 cut new entry off; HW is halted by phase
+//      2; the only threads holding stack-local copies were the ones we
+//      force-completed, which have already returned).
 static int xhci_disconnect_slot(struct xhci_hc *hc, int slot_id) {
     if (slot_id < 1 || slot_id > (int)hc->max_slots) {
         ERROR("disconnect_slot: invalid slot %d\n", slot_id);
@@ -928,25 +958,63 @@ static int xhci_disconnect_slot(struct xhci_hc *hc, int slot_id) {
     }
     INFO("slot %d: tearing down (disconnect)\n", slot_id);
 
+    // Phase 1: snapshot + force-fail under hc->lock.
+    struct xhci_ring *snap_rings[32];
+    memset(snap_rings, 0, sizeof(snap_rings));
+    struct xhci_trb  *snap_ep0_trbs;
+
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
+
+    for (int dci = 2; dci <= 31; dci++) {
+        snap_rings[dci] = hc->ep_rings[slot_id * 32 + dci];
+        hc->ep_rings[slot_id * 32 + dci] = NULL;
+    }
+    snap_ep0_trbs = hc->ep0_rings[slot_id].trbs;
+    // Zero the entire embedded ring (trbs=NULL is the "slot dying" signal
+    // that xhci_control_transfer / xhci_set_tr_dequeue_ptr observe).
+    memset(&hc->ep0_rings[slot_id], 0, sizeof(hc->ep0_rings[slot_id]));
+
+    struct xhci_xfer_wait *w, *tmp;
+    int forced = 0;
+    list_for_each_entry_safe(w, tmp, &hc->xfer_waiters, node) {
+        if (w->slot_id == (uint8_t)slot_id) {
+            w->completion_code = XHCI_CC_USB_TRANSACTION_ERR;
+            w->residual_len    = 0;
+            xhci_wmb();
+            w->completed = 1;
+            list_del_init(&w->node);
+            forced++;
+        }
+    }
+
+    spin_unlock_irq_restore(&hc->lock, flags);
+
+    if (forced) {
+        DEBUG("slot %d: force-completed %d in-flight xfer waiter(s)\n",
+              slot_id, forced);
+        nk_wait_queue_wake_all(hc->waitq);
+    }
+
+    // Phase 2: tell the controller to drop the slot. Sleeps on completion,
+    // so the lock must be released first.
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_DISABLE_SLOT)
                      | XHCI_TRB_SLOT_ID(slot_id);
     if (xhci_run_command(hc, 0, 0, control, NULL, "DISABLE_SLOT") < 0) {
         ERROR("slot %d: DISABLE_SLOT failed (continuing teardown)\n", slot_id);
     }
 
+    // Phase 3: free what we snapshotted. Safe now -- entry checks see NULL
+    // and HW has been told to stop. Any racing transfer thread either
+    // completed cleanly before phase 1 (its ring lives on in snap_rings until
+    // we free it here, but the thread no longer touches it), or was
+    // force-completed and returned.
     for (int dci = 2; dci <= 31; dci++) {
-        struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
-        if (r) {
-            if (r->trbs) kmem_free(r->trbs);
-            kmem_free(r);
-            hc->ep_rings[slot_id * 32 + dci] = NULL;
+        if (snap_rings[dci]) {
+            if (snap_rings[dci]->trbs) kmem_free(snap_rings[dci]->trbs);
+            kmem_free(snap_rings[dci]);
         }
     }
-
-    if (hc->ep0_rings[slot_id].trbs) {
-        kmem_free(hc->ep0_rings[slot_id].trbs);
-        memset(&hc->ep0_rings[slot_id], 0, sizeof(hc->ep0_rings[slot_id]));
-    }
+    if (snap_ep0_trbs) kmem_free(snap_ep0_trbs);
 
     if (hc->device_ctxs[slot_id]) {
         kmem_free(hc->device_ctxs[slot_id]);
@@ -971,12 +1039,50 @@ static int xhci_disconnect_slot(struct xhci_hc *hc, int slot_id) {
     return 0;
 }
 
+// Wait-queue predicate: any port-change work pending? Reads are racy on
+// purpose -- the worker re-checks under hc->lock once it wakes.
+static int xhci_port_work_pending(void *p) {
+    struct xhci_hc *hc = (struct xhci_hc *)p;
+    return (hc->pending_port_enum | hc->pending_port_disconnect) != 0;
+}
+
+// Per-controller worker. Sleeps on hc->waitq, woken by the IRQ-side drain
+// whenever a PORT_STATUS_CHANGE_EVENT lands. Pre-fix, the pending bitmaps
+// were only consumed by xhci_scan_ports at boot, so any hot-plug after boot
+// queued bits that were never drained -- devices plugged in after init were
+// invisible, devices unplugged after init leaked their slot/context/rings
+// forever. The teardown path also calls xhci_run_command which sleeps, so
+// it must run in a real thread, not the IRQ handler.
+static void xhci_port_worker(void *priv, void **out) {
+    struct xhci_hc *hc = (struct xhci_hc *)priv;
+    INFO("port worker started\n");
+    nk_wait_queue_t *qs[1]   = { hc->waitq };
+    int (*checks[1])(void *) = { xhci_port_work_pending };
+    void *states[1]          = { hc };
+    while (1) {
+        if (!xhci_port_work_pending(hc)) {
+            nk_wait_queue_sleep_extended_multiple(1, qs, checks, states);
+        }
+        xhci_process_pending_enumerations(hc);
+        xhci_process_pending_disconnects(hc);
+    }
+}
+
+// Mirror of xhci_process_pending_enumerations for the disconnect bitmap;
+// the same locking rationale applies (set under hc->lock from drain, the
+// teardown path itself sleeps so the lock must be dropped before it runs).
 static void xhci_process_pending_disconnects(struct xhci_hc *hc) {
-    while (hc->pending_port_disconnect) {
-        int bit = __builtin_ffsll((long long)hc->pending_port_disconnect) - 1;
-        if (bit < 0) break;
-        uint32_t port = (uint32_t)bit;
+    while (1) {
+        uint8_t flags = spin_lock_irq_save(&hc->lock);
+        uint64_t pending = hc->pending_port_disconnect;
+        if (!pending) {
+            spin_unlock_irq_restore(&hc->lock, flags);
+            return;
+        }
+        int bit = __builtin_ffsll((long long)pending) - 1;
         hc->pending_port_disconnect &= ~(1ULL << bit);
+        spin_unlock_irq_restore(&hc->lock, flags);
+        uint32_t port = (uint32_t)bit;
         int slot = xhci_slot_for_port(hc, port);
         if (slot > 0) {
             xhci_disconnect_slot(hc, slot);
@@ -1385,24 +1491,33 @@ int xhci_set_tr_dequeue_ptr(struct xhci_hc *hc, int slot_id, int dci) {
         ERROR("set_tr_dequeue: invalid DCI %d\n", dci);
         return -1;
     }
+
+    // Probe + reset ring state under hc->lock so a racing disconnect can't
+    // free the ring between our existence check and our writes to it.
+    uint8_t flags = spin_lock_irq_save(&hc->lock);
     struct xhci_ring *r;
     if (dci == XHCI_EP0_ID) {
         r = &hc->ep0_rings[slot_id];
+        if (!r->trbs) {
+            spin_unlock_irq_restore(&hc->lock, flags);
+            ERROR("set_tr_dequeue slot=%d dci=%d: no ring\n", slot_id, dci);
+            return -1;
+        }
     } else {
         r = hc->ep_rings[slot_id * 32 + dci];
+        if (!r || !r->trbs) {
+            spin_unlock_irq_restore(&hc->lock, flags);
+            ERROR("set_tr_dequeue slot=%d dci=%d: no ring\n", slot_id, dci);
+            return -1;
+        }
     }
-    if (!r || !r->trbs) {
-        ERROR("set_tr_dequeue slot=%d dci=%d: no ring\n", slot_id, dci);
-        return -1;
-    }
-
-    uint8_t flags = spin_lock_irq_save(&hc->lock);
     r->enq   = 0;
     r->deq   = 0;
     r->cycle = 1;
+    uint64_t trbs_phys = r->trbs_phys;
     spin_unlock_irq_restore(&hc->lock, flags);
 
-    uint64_t param   = r->trbs_phys | XHCI_EP_DCS;
+    uint64_t param   = trbs_phys | XHCI_EP_DCS;
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_SET_TR_DEQUEUE)
                      | XHCI_TRB_SLOT_ID(slot_id)
                      | (((uint32_t)dci & 0x1f) << 16);
@@ -1419,12 +1534,6 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
         ERROR("normal xfer: invalid DCI %d\n", dci);
         return -1;
     }
-    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
-    if (!r) {
-        ERROR("normal xfer slot=%d dci=%d: endpoint not configured\n",
-              slot_id, dci);
-        return -1;
-    }
 
     uint32_t status  = length;
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_NORMAL) | XHCI_TRB_IOC; // interrupt on completion
@@ -1435,7 +1544,20 @@ int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, ui
     wait.slot_id = (uint8_t)slot_id;
     wait.ep_id   = (uint8_t)dci;
 
+    // Look up the ring under hc->lock: disconnect nulls the entry under the
+    // same lock right before freeing, so checking here racelessly tells us
+    // whether the slot is still alive. Once we've enqueued the TRB and
+    // doorbell'd under the lock, our waiter is on hc->xfer_waiters; a
+    // concurrent disconnect that runs after we release will force-complete
+    // it instead of leaving us stuck.
     uint8_t flags = spin_lock_irq_save(&hc->lock);
+    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
+    if (!r) {
+        spin_unlock_irq_restore(&hc->lock, flags);
+        ERROR("normal xfer slot=%d dci=%d: endpoint not configured\n",
+              slot_id, dci);
+        return -1;
+    }
     xhci_ring_reserve(r, 1);
     wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
     list_add_tail(&wait.node, &hc->xfer_waiters);
@@ -1469,11 +1591,6 @@ int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uin
         ERROR("isoch xfer: invalid DCI %d\n", dci);
         return -1;
     }
-    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
-    if (!r) {
-        ERROR("isoch xfer slot=%d dci=%d: endpoint not configured\n", slot_id, dci);
-        return -1;
-    }
 
     uint32_t status  = length;
     uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_ISOCH) | XHCI_TRB_SIA | XHCI_TRB_IOC;
@@ -1484,7 +1601,15 @@ int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci, void *buf, uin
     wait.slot_id = (uint8_t)slot_id;
     wait.ep_id   = (uint8_t)dci;
 
+    // See xhci_normal_transfer for the rationale: ring lookup under hc->lock
+    // closes the disconnect race.
     uint8_t flags = spin_lock_irq_save(&hc->lock);
+    struct xhci_ring *r = hc->ep_rings[slot_id * 32 + dci];
+    if (!r) {
+        spin_unlock_irq_restore(&hc->lock, flags);
+        ERROR("isoch xfer slot=%d dci=%d: endpoint not configured\n", slot_id, dci);
+        return -1;
+    }
     xhci_ring_reserve(r, 1);
     wait.last_trb_phys = xhci_xfer_enqueue(r, (uint64_t)buf, status, control);
     list_add_tail(&wait.node, &hc->xfer_waiters);
@@ -1556,6 +1681,9 @@ static uint64_t xhci_xfer_enqueue(struct xhci_ring *r, uint64_t param, uint32_t 
 // Issue one USB control transfer on a slot's EP0 ring and wait for its TRANSFER_EVENT
 // Returns bytes actually transferred on success
 int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, void *buf, uint16_t wLength) {
+    // r itself is stable (points into hc->ep0_rings[]). The "is the slot
+    // alive?" probe is r->trbs: disconnect zeroes that field under hc->lock
+    // before freeing the TRB array.
     struct xhci_ring *r = &hc->ep0_rings[slot_id];
     int dir_in   = (bmRequestType & USB_DIR_IN) != 0;
     int has_data = wLength > 0;
@@ -1599,6 +1727,13 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id, uint8_t bmRequestType
     // Atomic: reserve TD-sized run on the ring, enqueue TRBs,
     // register the waiter, ring the doorbell.
     uint8_t flags = spin_lock_irq_save(&hc->lock);
+    if (!r->trbs) {
+        // Slot was torn down between caller's last operation and now.
+        spin_unlock_irq_restore(&hc->lock, flags);
+        ERROR("control xfer slot=%d: EP0 ring gone (slot disconnected)\n",
+              slot_id);
+        return -1;
+    }
     xhci_ring_reserve(r, n_trbs);
     xhci_xfer_enqueue(r, setup_param, setup_status, setup_ctl);
     if (has_data) {
@@ -1677,6 +1812,16 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
             // header should already by logged
             break;
         case USB_DT_INTERFACE: {
+            // Refuse a short descriptor before casting -- a device that
+            // advertises bLength < 9 but type=USB_DT_INTERFACE would cause
+            // the cast to read past the descriptor into adjacent bytes
+            // (still in-buffer, but not part of this descriptor), letting
+            // the device steer driver matching with arbitrary neighbor data.
+            if (bLength < sizeof(struct usb_interface_descriptor)) {
+                DEBUG("slot %d: short iface descriptor (bLength=%u) at off=%u\n",
+                      slot_id, bLength, off);
+                break;
+            }
             struct usb_interface_descriptor *iface = (struct usb_interface_descriptor *)(buf + off);
             INFO("slot %d: iface %u alt %u: class=%u sub=%u proto=%u eps=%u\n",
                  slot_id,
@@ -1700,6 +1845,13 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
             break;
         }
         case USB_DT_ENDPOINT: {
+            // Same rationale as USB_DT_INTERFACE above: refuse short
+            // descriptors before casting.
+            if (bLength < sizeof(struct usb_endpoint_descriptor)) {
+                DEBUG("slot %d: short endpoint descriptor (bLength=%u) at off=%u\n",
+                      slot_id, bLength, off);
+                break;
+            }
             struct usb_endpoint_descriptor *ep = (struct usb_endpoint_descriptor *)(buf + off);
             uint8_t xfer = ep->bmAttributes & USB_EP_XFER_MASK;
             INFO("slot %d:   ep%u %s %s max_pkt=%u interval=%u\n",
@@ -1736,7 +1888,7 @@ static void xhci_parse_config_descriptor(int slot_id, uint8_t *buf, uint16_t len
 // parent_hub_slot=0 means "device on the root hub".
 static int xhci_enumerate_at_slot(struct xhci_hc *hc, int slot_id,
                                   uint32_t root_port, uint32_t speed,
-                                  uint32_t route_string,
+                                  uint32_t route_string, uint8_t tier,
                                   int parent_hub_slot, int parent_port) {
     if (xhci_alloc_device_ctx(hc, slot_id) < 0) return -1;
     if (xhci_alloc_input_ctx(hc, slot_id, root_port, speed,
@@ -1942,6 +2094,8 @@ static int xhci_enumerate_at_slot(struct xhci_hc *hc, int slot_id,
     udev->address        = usb_addr;
     udev->speed          = (uint8_t)speed;
     udev->port           = (uint8_t)root_port;
+    udev->tier           = tier;
+    udev->route          = route_string;
     udev->vendor_id      = dev_desc->idVendor;
     udev->product_id     = dev_desc->idProduct;
     udev->bcd_usb        = dev_desc->bcdUSB;
@@ -1983,7 +2137,9 @@ static int xhci_enumerate_port(struct xhci_hc *hc, uint32_t port) {
     }
     int slot_id = xhci_enable_slot(hc);
     if (slot_id < 0) return -1;
-    return xhci_enumerate_at_slot(hc, slot_id, port, speed, 0, 0, 0);
+    return xhci_enumerate_at_slot(hc, slot_id, port, speed,
+                                  /*route=*/0, /*tier=*/0,
+                                  /*parent_hub_slot=*/0, /*parent_port=*/0);
 }
 
 // Enumerate a device discovered on `hub_port` of a hub at slot `hub_dev->slot_id`.
@@ -1998,10 +2154,32 @@ int xhci_enumerate_hub_port(struct xhci_hc *hc, struct usb_device *hub_dev,
         ERROR("enumerate_hub_port: NULL hub_dev\n");
         return -1;
     }
+    // xHCI route strings have five 4-bit tier fields. Tier 0 is a device on
+    // the root hub; tier 5 is the deepest legal device. Refusing >5 also
+    // bounds recursion through usb_hub_probe -> xhci_enumerate_hub_port and
+    // protects the kernel stack against a malicious nested-hub topology.
+    if (hub_dev->tier >= 5) {
+        ERROR("hub depth %u exceeds USB 5-tier limit; refusing port %u\n",
+              hub_dev->tier + 1, hub_port);
+        return -1;
+    }
+    if ((hub_port & 0xf) != hub_port) {
+        ERROR("hub port %u does not fit in route-string nibble\n", hub_port);
+        return -1;
+    }
+
     int slot_id = xhci_enable_slot(hc);
     if (slot_id < 0) return -1;
 
-    uint32_t route_string = (uint32_t)(hub_port & 0xf);
+    // OR this hub's port into the next tier's nibble of the parent's route.
+    // Previously only `hub_port & 0xf` was written, which is correct for a
+    // hub on the root but misroutes traffic for chained hubs (the xHC walks
+    // the route nibbles to forward packets, so omitting upstream nibbles
+    // sends them to a different device on the same root port).
+    uint32_t route_string =
+        hub_dev->route | ((uint32_t)(hub_port & 0xf) << (hub_dev->tier * 4));
+    uint8_t  new_tier = (uint8_t)(hub_dev->tier + 1);
+
     int parent_hub_slot = 0;
     int parent_port     = 0;
     if (speed == USB_SPEED_LS || speed == USB_SPEED_FS) {
@@ -2009,7 +2187,8 @@ int xhci_enumerate_hub_port(struct xhci_hc *hc, struct usb_device *hub_dev,
         parent_port     = hub_port;
     }
     return xhci_enumerate_at_slot(hc, slot_id, hub_dev->port, speed,
-                                  route_string, parent_hub_slot, parent_port);
+                                  route_string, new_tier,
+                                  parent_hub_slot, parent_port);
 }
 
 //
@@ -2429,11 +2608,23 @@ static int xhci_init(struct xhci_hc *hc) {
     }
 
     // power on root hub ports and pick up any devices that were
-    // already plugged in when the controller started. 
+    // already plugged in when the controller started.
     // xhci_pci_init starts a fallback idle thread on
-    // CPU 0 before reaching here so the scheduler has 
+    // CPU 0 before reaching here so the scheduler has
     // someone to switch to when we sleep.
     xhci_scan_ports(hc);
+
+    // Start the per-controller port worker. Hot-plug events that arrive
+    // after this point set bits in pending_port_enum/disconnect from the
+    // IRQ drain; the worker is the thread context that actually runs
+    // enumeration and slot teardown (both of which sleep). Started after
+    // xhci_scan_ports so the initial pass runs synchronously on the boot
+    // thread; the worker then handles everything from runtime onward.
+    if (nk_thread_start(xhci_port_worker, hc, NULL, 0,
+                        TSTACK_DEFAULT, NULL, -1) != 0) {
+        ERROR("could not start port worker thread\n");
+        goto fail;
+    }
 
     return 0;
 
