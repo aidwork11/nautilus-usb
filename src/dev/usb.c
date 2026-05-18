@@ -270,24 +270,18 @@ int usb_isoch_transfer(struct usb_device *dev, uint8_t ep, void *data, size_t le
 }
 
 int usb_get_descriptor(struct usb_device *dev, uint8_t dt_type, uint8_t dt_index, void *buf, uint16_t length) {
-    // Standard "device-to-host, standard, device" descriptor read.
-    // wValue's high byte is the descriptor type, low byte is the index.
     return usb_control_transfer(dev, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR, (uint16_t)(dt_type << 8) | dt_index, 0, buf, length);
 }
 
 
-// Switch interface `intf` to alternate setting `alt`. Order: SET_INTERFACE
-// on the device side first (matches Linux), then xhci_reconfigure_endpoints
-// to bring the controller's slot context in sync.
+// Switch interface "intf" to alternate setting "alt"
 int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
     if (!dev || !dev->hc) {
         ERROR("set_interface: NULL device or hc\n");
         return -1;
     }
 
-    // Find the currently-active alt for this interface (may be NULL if
-    // this is the first call and the device's default alt 0 was never
-    // marked active -- defensive) and the requested new alt.
+    // Find the currently-active alt for this interface (may be NULL) and the requested new alt
     struct usb_iface_alt *old_alt = NULL;
     struct usb_iface_alt *new_alt = NULL;
     for (uint32_t i = 0; i < dev->num_iface_alts; i++) {
@@ -307,9 +301,8 @@ int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
         return 0;
     }
 
-    // 1. SET_INTERFACE control request: host-to-device, standard, interface recipient
-    int rc = usb_control_transfer(dev, 0x01, USB_REQ_SET_INTERFACE,
-                                  alt, intf, NULL, 0);
+    // 1. SET_INTERFACE control request
+    int rc = usb_control_transfer(dev, 0x01, USB_REQ_SET_INTERFACE, alt, intf, NULL, 0);
     if (rc < 0) {
         ERROR("set_interface: slot %u: SET_INTERFACE(intf=%u, alt=%u) failed\n",
               dev->slot_id, intf, alt);
@@ -328,7 +321,7 @@ int usb_set_interface(struct usb_device *dev, uint8_t intf, uint8_t alt) {
         return -1;
     }
 
-    // 3. Flip active flags and rebuild the active endpoint union
+    // 3. Flip active flags and rebuild the active endpoint struture
     if (old_alt) old_alt->active = 0;
     new_alt->active = 1;
 
