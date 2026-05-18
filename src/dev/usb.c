@@ -242,11 +242,8 @@ int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
                                USB_EP_XFER_INTR, "intr");
 }
 
-// Isoch dispatches to xhci_isoch_transfer rather than xhci_normal_transfer
-// because the underlying TRB type is different (ISOCH vs NORMAL).
-// Validation shape mirrors usb_normal_transfer.
-int usb_isoch_transfer(struct usb_device *dev, uint8_t ep,
-                       void *data, size_t length, int dir) {
+// dispatches to xhci_isoch_transfer
+int usb_isoch_transfer(struct usb_device *dev, uint8_t ep, void *data, size_t length, int dir) {
     if (!dev || !dev->hc) {
         ERROR("isoch xfer: NULL device or hc\n");
         return -1;
@@ -269,8 +266,7 @@ int usb_isoch_transfer(struct usb_device *dev, uint8_t ep,
               USB_EP_XFER_ISOCH);
         return -1;
     }
-    return xhci_isoch_transfer(dev->hc, dev->slot_id, e->dci,
-                               data, (uint16_t)length);
+    return xhci_isoch_transfer(dev->hc, dev->slot_id, e->dci, data, (uint16_t)length);
 }
 
 int usb_get_descriptor(struct usb_device *dev, uint8_t dt_type, uint8_t dt_index, void *buf, uint16_t length) {

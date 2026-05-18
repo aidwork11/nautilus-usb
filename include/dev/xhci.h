@@ -223,7 +223,7 @@ struct xhci_trb {
 #define XHCI_TRB_IOC           (1u << 5)   // interrupt on completion
 #define XHCI_TRB_IDT           (1u << 6)   // immediate data
 #define XHCI_TRB_BSR           (1u << 9)   // block set address request (ADDRESS_DEVICE only)
-#define XHCI_TRB_SIA           (1u << 9)   // start isoch ASAP (ISOCH only; same bit, different TRB)
+#define XHCI_TRB_SIA           (1u << 9)   // start isoch ASAP (ISOCH only)
 #define XHCI_TRB_TC            (1u << 1)   // toggle cycle (LINK only)
 #define XHCI_TRB_DIR_IN        (1u << 16)  // data stage direction = IN
 #define XHCI_TRB_TYPE_SHIFT    10
@@ -378,10 +378,7 @@ struct xhci_ep_ctx {
 #define XHCI_EP_DW1_MAX_PKT_SIZE_SHIFT  16 // largest single packet size the endpoint can handle
 #define XHCI_EP_DW1_MAX_PKT_SIZE_MASK   (0xffffu << 16)
 
-// Endpoint context dword 4 fields
-// low 16: Average TRB Length (bandwidth estimation)
-// high 16: Max ESIT Payload — bytes per Endpoint Service Interval Time, required
-//          for periodic endpoints (isoch + intr); bulk/control leave it 0.
+// Max ESIT Payload — bytes per Endpoint Service Interval Time
 #define XHCI_EP_DW4_MAX_ESIT_PAY_SHIFT  16
 
 // Each endpoint has its own transfer ring. Tells the hardware that the command at this address is ready
@@ -555,9 +552,7 @@ int xhci_control_transfer(struct xhci_hc *hc, int slot_id,
 int xhci_normal_transfer(struct xhci_hc *hc, int slot_id, int dci,
                          void *buf, uint16_t length);
 
-// ISOCH TRB transfer on a non-EP0 endpoint. Single-TRB, SIA-scheduled.
-// Implemented against spec but no in-tree consumer — see comment on
-// the implementation in xhci.c.
+// ISOCH TRB transfer on a non-EP0 endpoint. Single-TRB, SIA-scheduled
 int xhci_isoch_transfer(struct xhci_hc *hc, int slot_id, int dci,
                         void *buf, uint16_t length);
 

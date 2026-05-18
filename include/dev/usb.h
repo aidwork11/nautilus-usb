@@ -215,9 +215,7 @@ int usb_interrupt_transfer(struct usb_device *dev, uint8_t ep,
                            void *data, size_t length, int dir);
 
 // Issue a USB isochronous transfer on the given endpoint. dir is
-// USB_DIR_IN or USB_DIR_OUT. Real-time semantics: no retries, drops
-// on missed service interval. Implemented but not yet exercised by
-// any class driver.
+// USB_DIR_IN or USB_DIR_OUT. No retries on packet loss
 int usb_isoch_transfer(struct usb_device *dev, uint8_t ep,
                        void *data, size_t length, int dir);
 
