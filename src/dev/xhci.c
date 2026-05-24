@@ -46,15 +46,11 @@ xhci_match(struct pci_dev *pdev) {
 }
 
 
-//
-// Capability-register parse 
-//
-
-// Snapshot the capability registers
-// derive the operational/runtime/doorbell
-// register windows, and stash everything the rest of the driver needs int struct xhci_hc. 
-// Capability registers are read-only
-
+// xHCI spec section 5.3 (p.380) - Capability Registers
+// These are read-only registers set by hardware at reset.
+// CAPLENGTH (5.3.1) gives byte offset to operational registers.
+// DBOFF (5.3.7) and RTSOFF (5.3.8) give offsets to doorbell
+// and runtime register sets respectively.
 static int xhci_read_capabilities(struct xhci_hc *hc) {
     uint8_t *bar0 = (uint8_t *)hc->cap_base;
 
@@ -166,15 +162,10 @@ static int xhci_bios_handoff(struct xhci_hc *hc) {
 }
 
 
-//
-// Controller reset
-//
-//
-//   1. Halt: clear USBCMD.RS, then poll USBSTS.HCH until it sets.
-//   2. Reset: set USBCMD.HCRST. The bit self-clears when reset is done.
-//      USBSTS.CNR must also clear before any other operational-register access.
-//   3. Re-read capabilities
-//
+// xHCI Specification Section 4.2 (p. 80) - Host Controller Initialization
+//   1. Halt: clear USBCMD.RS, poll USBSTS.HCH until set
+//   2. Assert HCRST, wait for self-clear
+//   3. Wait for USBSTS.CNR to clear before any further register access
 static int xhci_reset(struct xhci_hc *hc) {
     uint8_t *op = (uint8_t *)hc->op_base;
 
@@ -215,12 +206,10 @@ static int xhci_reset(struct xhci_hc *hc) {
 }
 
 
-//
-// Program CONFIG.MaxSlotsEn
-// tells the controller how many device slots to enable.
-// Must be done after reset and before the controller is started.
-// We enable the maximum the controller advertises (HCSPARAMS1.MaxSlots).
-//
+// xHCI spec section 4.2 (p.80) - Host Controller Initialization
+// After reset, before starting the controller, MaxSlotsEn in the CONFIG
+// register must be programmed with the number of device slots to enable.
+// We set it to the maximum the hardware supports (HCSPARAMS1.MaxSlots).
 static int xhci_set_max_slots(struct xhci_hc *hc) {
     uint8_t *op = (uint8_t *)hc->op_base; 
 
@@ -242,11 +231,11 @@ static int xhci_set_max_slots(struct xhci_hc *hc) {
 }
 
 
-//
-// Allocate and program the Device Context Base Address Array
-// Index 0 is scratchpad pointer or NULL
-// slots 1..MaxSlots will point to per-device output contexts
-//
+// xHCI spec section 4.2 (p.80) - Host Controller Initialization
+// xHCI spec section 6.1 (p.440) - Device Context Base Address Array
+// Index 0 holds the scratchpad buffer array pointer.
+// Indices 1..MaxSlots hold pointers to per-device output contexts.
+// Must be 64-byte aligned (spec 6.1).
 static int xhci_setup_dcbaa(struct xhci_hc *hc) {
     size_t size = (hc->max_slots + 1) * sizeof(uint64_t); // +1 for SCB
 
@@ -275,11 +264,13 @@ static int xhci_setup_dcbaa(struct xhci_hc *hc) {
 }
 
 
-//
-// Allocate scratchpad buffers if the controller requires them
-// Mem needed = CSPARAMS2.MaxScratchpadBufs * 4 KB pages
-//
+// xHCI spec section 4.20 (p.334) - Scratchpad Buffers
+// The controller may require private memory pages for internal use.
+// Scratchpad Allocation allows xHC to request one or more PAGESIZE
+// buffers of system memory for storing internal state.
 static int xhci_setup_scratchpads(struct xhci_hc *hc) {
+
+    // find number of scratchpad buffers needed from HCSPARAMS2.MaxScratchpadBufs (section 5.3.4, p. 383)
     uint32_t spb = XHCI_HCS2_SPB_MAX(hc->hcs_params2);
     hc->scratchpad_count = spb;
 
@@ -297,6 +288,7 @@ static int xhci_setup_scratchpads(struct xhci_hc *hc) {
     }
     hc->scratchpad_array_phys = (uint64_t)hc->scratchpad_array;
 
+    // allocate 4KB page per scratchpad buffer
     for (uint32_t i = 0; i < spb; i++) {
         void *page = kmem_mallocz(4096);
         if (!page) {
@@ -305,7 +297,8 @@ static int xhci_setup_scratchpads(struct xhci_hc *hc) {
         }
         hc->scratchpad_array[i] = (uint64_t)page;
     }
-
+    
+    // scratchpad buffer is stored in DCBAA[0]
     hc->dcbaa[0] = hc->scratchpad_array_phys;
 
     INFO("allocated %u scratchpad buffer(s), array at 0x%lx\n",
@@ -314,11 +307,10 @@ static int xhci_setup_scratchpads(struct xhci_hc *hc) {
 }
 
 
-//
+// xHCI spec section 4.9.3 (p. 178) - Command Ring management
 // Initialize the command ring and program CRCR
 // The last TRB is a LINK pointing back to TRB[0] with TC=1 (toggle cycle on traverse)
 // CRCR holds the ring's physical address and the initial ring cycle state
-//
 static int xhci_init_cmd_ring(struct xhci_hc *hc) {
     size_t size = XHCI_RING_SIZE * sizeof(struct xhci_trb);
 
@@ -327,6 +319,7 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
         ERROR("cannot allocate command ring (%lu bytes)\n", size);
         return -1;
     }
+    // store physical address of ring
     hc->cmd_ring.trbs_phys = (uint64_t)hc->cmd_ring.trbs;
 
     if (hc->cmd_ring.trbs_phys & (XHCI_RING_ALIGN - 1)) {
@@ -345,9 +338,9 @@ static int xhci_init_cmd_ring(struct xhci_hc *hc) {
     // Last TRB links back to TRB[0] with TC=1 so the controller's CCS
     // toggles each time it traverses the ring boundary.
     struct xhci_trb *link = &hc->cmd_ring.trbs[XHCI_RING_SIZE - 1];
-    link->param   = hc->cmd_ring.trbs_phys;
-    link->status  = 0;
-    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC;
+    link->param   = hc->cmd_ring.trbs_phys;                         // point back to start of the ring
+    link->status  = 0;                                              // no status needed
+    link->control = XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_TC;     // this is a LINK TRB and we toggle Cycle bit
 
     // mask off the alignement bits - only send base address
     uint8_t *op = (uint8_t *)hc->op_base;
