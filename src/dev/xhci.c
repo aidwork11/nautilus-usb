@@ -2740,5 +2740,31 @@ int xhci_pci_init(struct naut_info *naut) {
 }
 
 int xhci_pci_deinit(void) {
+    struct xhci_hc *hc, *tmp;
+
+    INFO("deinitializing xHCI controllers\n");
+
+    list_for_each_entry_safe(hc, tmp, &xhci_controllers, node) {
+        uint8_t *op = (uint8_t *)hc->op_base;
+
+        // Halt the controller first: clear RS and wait for HCH
+        uint32_t cmd = xhci_readl(op + XHCI_OP_USBCMD);
+        xhci_writel(op + XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RS);
+        xhci_poll_until(op + XHCI_OP_USBSTS,
+                        XHCI_STS_HCH, XHCI_STS_HCH,
+                        1000000, "USBSTS.HCH (deinit halt)");
+
+        // Disable interrupts
+        xhci_writel(op + XHCI_OP_USBCMD,
+                    xhci_readl(op + XHCI_OP_USBCMD) & ~XHCI_CMD_INTE);
+
+        // Free all allocated memory and registered devices
+        xhci_teardown(hc);
+
+        list_del(&hc->node);
+        free(hc);
+    }
+
+    INFO("xHCI deinit complete\n");
     return 0;
 }
