@@ -374,15 +374,6 @@ static int usb_msc_probe(struct usb_device *udev) {
 //
 // Block-device integration
 //
-// One NK block device per bound USB MSC slot. NK callers (filesystem,
-// partitioner, etc.) come in through nk_block_dev_read/write; we serialize
-// at the BOT-command granularity with m->iolock so concurrent block
-// requests don't interleave CBW/data/CSW phases on the wire.
-//
-// Per BOT command the xHCI single-TRB transfer cap is 65535 bytes, so a
-// caller's block count gets split into chunks of `0xffff / block_size`
-// blocks. Each chunk is one (CBW, data, CSW) round-trip.
-//
 
 static int usb_msc_blk_get_characteristics(void *state,
                                            struct nk_block_dev_characteristics *c) {
@@ -446,8 +437,7 @@ static int usb_msc_blk_io(struct usb_msc_dev *m,
         }
         if (residue != 0) {
             // Short BOT means the device transferred fewer bytes than asked
-            // -- for a block API that's a hard error; we don't have a way
-            // to surface partial-block success to the caller.
+            // for a block API that's a hard error
             ERROR("blk %s slot %u: short transfer (lba=%lu chunk=%u residue=%u)\n",
                   dir_in ? "read" : "write",
                   m->udev->slot_id, blocknum, chunk, residue);
@@ -496,16 +486,11 @@ static struct nk_block_dev_int usb_msc_blk_int = {
     .write_blocks        = usb_msc_blk_write,
 };
 
-// Sanity-check block_size before publishing the block device. Devices
-// reporting nonsense (0 or wildly out-of-spec values) would otherwise
-// poison every arithmetic operation in the IO path.
 static int usb_msc_block_size_ok(uint32_t bsize) {
     return bsize == 512 || bsize == 1024 || bsize == 2048 || bsize == 4096;
 }
 
-// Register an NK block device named "usb-mscN" where N is the slot's
-// index in usb_msc_devs[]. Names are stable across one boot but reused
-// after disconnect; that matches the rest of NK's device-name policy.
+// Register an NK block device named "usb-mscN"
 static int usb_msc_blk_register(struct usb_msc_dev *m) {
     uint32_t idx = (uint32_t)(m - usb_msc_devs);
     snprintf(m->devname, sizeof(m->devname), "usb-msc%u", idx);
@@ -542,17 +527,6 @@ void usb_msc_dump(void) {
     }
 }
 
-// Release this MSC slot when the underlying usb_device is being torn down.
-// Returning the slot here is what makes the static usb_msc_devs[] pool
-// reusable across plug/unplug cycles. After this returns, the framework
-// frees `udev`; any further class-driver access to this slot's `udev` would
-// be a use-after-free, so we NULL it out atomically with the slot release.
-//
-// Order: unregister the block device first so new NK callers can't enter
-// usb_msc_blk_io. Then take the iolock so any in-flight block IO drains
-// (xhci_disconnect_slot already force-completed its xfer waiter, so the
-// in-flight call returns -1 quickly and releases the semaphore). Then it's
-// safe to free the semaphore and zero the slot.
 static void usb_msc_disconnect(struct usb_device *udev) {
     struct usb_msc_dev *m = (struct usb_msc_dev *)udev->driver_data;
     if (!m) return;
